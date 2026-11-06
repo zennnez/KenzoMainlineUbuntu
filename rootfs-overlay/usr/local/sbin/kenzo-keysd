@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+"""
+kenzo-keysd: Unified physical key daemon for Xiaomi Redmi Note 3 Pro (Kenzo).
+Listens on input event devices in a single epoll event loop (zero busy-looping).
+
+Key behaviors:
+  - KEY_POWER (116):
+      * Short press (< 2.5s): Toggle screen on/off (/usr/local/sbin/kenzo-screen toggle).
+      * Long press (>= 3.0s): Clean system reboot (restarts the server).
+  - KEY_VOLUMEUP (115):
+      * Double press (<= 0.45s): Run/toggle btop system monitor on phone display.
+      * If Power is held: Increase console font size.
+      * If screen is off: Wake up and turn screen on.
+      * If screen is on & no GUI active: Increase backlight brightness (+10%).
+  - KEY_VOLUMEDOWN (114):
+      * Double press (<= 0.45s): Run/toggle btop system monitor on phone display.
+      * If Power is held: Decrease console font size.
+      * If screen is off: Wake up and turn screen on.
+      * If screen is on & no GUI active: Decrease backlight brightness (-10%, clamped at min 3%).
+"""
+
+import errno
+import glob
+import os
+import selectors
+import struct
+import subprocess
+import sys
+import time
+
+EV_KEY = 1
+KEY_VOLUMEDOWN = 114
+KEY_VOLUMEUP = 115
+KEY_POWER = 116
+
+EVENT_SIZE = struct.calcsize("=qqHHi")
+DOUBLE_PRESS_TIMEOUT = 0.45
+
+FONTS = [
+    "Lat15-Terminus16.psf.gz",
+    "Lat15-Terminus20x10.psf.gz",
+    "Lat15-Terminus24x12.psf.gz",
+    "Lat15-Terminus28x14.psf.gz",
+    "Lat15-Terminus32x16.psf.gz",
+]
+FONT_STATE = "/run/kenzo-font.idx"
+
+def log(msg):
+    print(f"{time.strftime('%b %d %H:%M:%S')} kenzo-keysd: {msg}", flush=True)
+
+def launch_btop_on_phone():
+    log("Double volume press -> Launch/toggle btop on phone display")
+    if not is_screen_on():
+        screen_on()
+    try:
+        subprocess.run(["/usr/local/bin/kenzo-cmd", "btop"], check=False)
+    except Exception as e:
+        log(f"Failed to execute kenzo-cmd btop: {e}")
+
+def get_font_idx():
+    try:
+        with open(FONT_STATE, "r") as f:
+            idx = int(f.read().strip())
+            return max(0, min(len(FONTS) - 1, idx))
+    except Exception:
+        return 2  # Default: 24x12 (Terminus24x12.psf.gz)
+
+def set_font_idx(idx):
+    idx = max(0, min(len(FONTS) - 1, idx))
+    font_file = os.path.join("/usr/share/consolefonts", FONTS[idx])
+    if os.path.exists(font_file):
+        subprocess.run(["setfont", font_file], check=False)
+        log(f"Console font changed: {FONTS[idx]} (level {idx+1}/{len(FONTS)})")
+    try:
+        with open(FONT_STATE, "w") as f:
+            f.write(f"{idx}\n")
+    except Exception:
+        pass
+    return idx
+
+def adjust_font(step):
+    cur = get_font_idx()
+    new_idx = cur + step
+    set_font_idx(new_idx)
+
+def get_backlight_dir():
+    dirs = glob.glob("/sys/class/backlight/*")
+    return dirs[0] if dirs else None
+
+def get_brightness_info():
+    b_dir = get_backlight_dir()
+    if not b_dir:
+        return 0, 0
+    try:
+        with open(os.path.join(b_dir, "brightness"), "r") as f:
+            cur = int(f.read().strip())
+        with open(os.path.join(b_dir, "max_brightness"), "r") as f:
+            mx = int(f.read().strip())
+        return cur, mx
+    except Exception:
+        return 0, 0
+
+def is_screen_on():
+    try:
+        p = subprocess.run(["/usr/local/sbin/kenzo-screen", "is_screen_on"],
+                           capture_output=True, text=True, timeout=2)
+        if p.stdout.strip() in ("yes", "no"):
+            return p.stdout.strip() == "yes"
+    except Exception:
+        pass
+    cur, _ = get_brightness_info()
+    return cur > 0
+
+def toggle_screen():
+    log("POWER -> Toggle screen")
+    subprocess.run(["/usr/local/sbin/kenzo-screen", "toggle"], check=False)
+
+def screen_on():
+    log("Wake up -> Screen ON")
+    subprocess.run(["/usr/local/sbin/kenzo-screen", "on"], check=False)
+
+def adjust_brightness(delta_pct):
+    b_dir = get_backlight_dir()
+    if not b_dir:
+        return
+    cur, mx = get_brightness_info()
+    if mx <= 0:
+        return
+    step = int(mx * (delta_pct / 100.0))
+    if step == 0:
+        step = 1 if delta_pct > 0 else -1
+    min_val = max(5, int(mx * 0.03))
+    new_val = max(min_val, min(mx, cur + step))
+    try:
+        with open(os.path.join(b_dir, "brightness"), "w") as f:
+            f.write(f"{new_val}\n")
+        log(f"Backlight adjusted: {cur} -> {new_val} (max {mx})")
+    except Exception as e:
+        log(f"Failed to write brightness: {e}")
+
+def is_gui_running():
+    for name in ("phosh", "sway", "labwc", "gnome-shell", "weston", "Xorg", "Xwayland"):
+        if subprocess.run(["pgrep", "-x", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+            return True
+    return False
+
+def check_key(caps_path, key_code):
+    try:
+        with open(caps_path, "r") as f:
+            words = f.read().strip().split()
+        word_idx = key_code // 64
+        bit_idx = key_code % 64
+        if word_idx < len(words):
+            word_val = int(words[-(word_idx + 1)], 16)
+            return bool((word_val >> bit_idx) & 1)
+    except Exception:
+        pass
+    return False
+
+def find_candidate_devices():
+    candidates = []
+    for path in sorted(glob.glob("/dev/input/event*")):
+        caps_path = f"/sys/class/input/{os.path.basename(path)}/device/capabilities/key"
+        if not os.path.exists(caps_path):
+            continue
+        has_pwr = check_key(caps_path, KEY_POWER)
+        has_vol = check_key(caps_path, KEY_VOLUMEDOWN) or check_key(caps_path, KEY_VOLUMEUP)
+        if has_pwr or has_vol:
+            name_path = f"/sys/class/input/{os.path.basename(path)}/device/name"
+            name = ""
+            if os.path.exists(name_path):
+                try:
+                    with open(name_path, "r") as nf:
+                        name = nf.read().strip()
+                except Exception:
+                    pass
+            candidates.append((path, name))
+    return candidates
+
+def main():
+    sel = selectors.DefaultSelector()
+    dev_files = {}
+
+    candidates = find_candidate_devices()
+    if not candidates:
+        log("No candidate button input devices found in /dev/input/event*")
+        sys.exit(1)
+
+    for path, name in candidates:
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            sel.register(fd, selectors.EVENT_READ)
+            dev_files[fd] = (path, name)
+            log(f"Listening on {path} ({name})")
+        except Exception as e:
+            log(f"Failed to open {path}: {e}")
+
+    if not dev_files:
+        log("Could not open any input event devices.")
+        sys.exit(1)
+
+    log("Daemon ready. Monitoring POWER, VOLUME_UP, and VOLUME_DOWN...")
+    power_pressed = False
+    power_press_time = None
+    power_combo_used = False
+    last_volup_time = 0.0
+    last_voldown_time = 0.0
+
+    while True:
+        try:
+            events = sel.select(timeout=0.5)
+        except (KeyboardInterrupt, SystemExit):
+            break
+
+        # Check long-press on Power button (>= 3.0s) -> REBOOT
+        if power_pressed and power_press_time is not None and not power_combo_used:
+            held = time.monotonic() - power_press_time
+            if held >= 3.0:
+                log("Power button held >= 3.0s: triggering system REBOOT!")
+                power_press_time = None
+                power_combo_used = True
+                subprocess.run(["systemctl", "reboot"], check=False)
+
+        for key, _ in events:
+            fd = key.fd
+            while True:
+                try:
+                    data = os.read(fd, EVENT_SIZE)
+                except OSError as err:
+                    if err.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                        break
+                    log(f"Error reading fd {fd}: {err}")
+                    break
+
+                if not data or len(data) < EVENT_SIZE:
+                    break
+
+                _, _, etype, code, value = struct.unpack("=qqHHi", data)
+                if etype != EV_KEY:
+                    continue
+
+                if code == KEY_POWER:
+                    if value == 1:  # Press
+                        power_pressed = True
+                        power_press_time = time.monotonic()
+                        power_combo_used = False
+                    elif value == 0:  # Release
+                        if power_press_time is not None and not power_combo_used:
+                            duration = time.monotonic() - power_press_time
+                            if duration < 2.5:
+                                toggle_screen()
+                        power_pressed = False
+                        power_press_time = None
+                        power_combo_used = False
+
+                elif code == KEY_VOLUMEUP and value == 1:  # Press
+                    now = time.monotonic()
+                    if power_pressed:
+                        power_combo_used = True
+                        adjust_font(+1)
+                    elif (now - last_volup_time) <= DOUBLE_PRESS_TIMEOUT:
+                        last_volup_time = 0.0
+                        launch_btop_on_phone()
+                    else:
+                        last_volup_time = now
+                        if not is_screen_on():
+                            screen_on()
+                        elif not is_gui_running():
+                            adjust_brightness(+10)
+
+                elif code == KEY_VOLUMEDOWN and value == 1:  # Press
+                    now = time.monotonic()
+                    if power_pressed:
+                        power_combo_used = True
+                        adjust_font(-1)
+                    elif (now - last_voldown_time) <= DOUBLE_PRESS_TIMEOUT:
+                        last_voldown_time = 0.0
+                        launch_btop_on_phone()
+                    else:
+                        last_voldown_time = now
+                        if not is_screen_on():
+                            screen_on()
+                        elif not is_gui_running():
+                            adjust_brightness(-10)
+
+    # Cleanup
+    for fd in dev_files:
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+
+if __name__ == "__main__":
+    main()

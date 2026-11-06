@@ -1,0 +1,15 @@
+[Unit]
+Description=Display Kenzo SSH connection banner on phone screen
+After=network-online.target NetworkManager.service getty@tty1.service
+Wants=network-online.target
+
+[Service]
+# Type=idle: start only after all other boot jobs are dispatched, so the banner is not
+# interleaved with systemd status lines / kernel messages on tty1.
+Type=idle
+Environment=TERM=linux
+ExecStart=/usr/local/sbin/kenzo-screen-banner
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

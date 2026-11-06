@@ -1,0 +1,25 @@
+From: Antigravity <antigravity@google.com>
+Subject: [PATCH] arm64: dts: qcom: msm8956-xiaomi-kenzo: allow voltage adjustment for USB PHY L13 regulator
+
+phy-qcom-usb-hs calls regulator_set_voltage_triplet(uphy->v3p3, 3050000, 3300000, 3300000).
+When regulator-min-microvolt == regulator-max-microvolt (3075000), the regulator core marks the
+regulator as fixed-voltage and rejects regulator_set_voltage with -EPERM ("voltage operation not allowed").
+This causes qcom_usb_hs_phy_power_on() to abort before sending the ULPI initialization sequence
+or releasing the POR reset, which leaves the USB PHY unpowered/unresponsive and results in
+USB device descriptor request failure (Code 43) on connected USB hosts.
+
+Set min to 3050000 and max to 3300000 to enable REGULATOR_CHANGE_VOLTAGE and allow PHY power-on.
+
+--- a/arch/arm64/boot/dts/qcom/msm8956-xiaomi-kenzo.dts
++++ b/arch/arm64/boot/dts/qcom/msm8956-xiaomi-kenzo.dts
+@@ -366,8 +366,8 @@
+ 		};
+ 
+ 		pm8950_l13: l13 {
+-			regulator-min-microvolt = <3075000>;
+-			regulator-max-microvolt = <3075000>;
++			regulator-min-microvolt = <3050000>;
++			regulator-max-microvolt = <3300000>;
+ 		};
+ 
+ 		pm8950_l14: l14 {

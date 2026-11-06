@@ -1,0 +1,9 @@
+[Unit]
+Description=Kenzo Wi-Fi: prefer 5 GHz over 2.4 GHz
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=-/usr/local/sbin/kenzo-wifi-band apply
+Nice=10

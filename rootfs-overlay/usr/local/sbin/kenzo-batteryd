@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# kenzo-batteryd: Battery charge limiter & USB pass-through manager for 24/7 server operation.
+#
+# Caps battery charging at STOP_THRESHOLD (default 60%).
+# Power continues directly from USB VBUS (pass-through) keeping battery at cap.
+# If battery capacity drops below STOP_THRESHOLD (<= START_THRESHOLD, default 58%), charging resumes.
+# If power is physically cut, runs on battery; when power returns, charges up to cap.
+#
+# Config: /etc/kenzo-battery.conf
+
+set -euo pipefail
+
+CONF="/etc/kenzo-battery.conf"
+STOP_THRESHOLD=60
+START_THRESHOLD=58
+CHECK_INTERVAL_SEC=30
+
+if [[ -f "$CONF" ]]; then
+	# shellcheck source=/dev/null
+	source "$CONF"
+fi
+
+SYS_BAT="/sys/class/power_supply/qcom-battery"
+SYS_USB="/sys/class/power_supply/qcom-smbchg-usb"
+CHARGING_ATTR="$SYS_USB/charging_enabled"
+
+get_capacity() {
+	if [[ -r "$SYS_BAT/capacity" ]]; then
+		cat "$SYS_BAT/capacity"
+	else
+		echo "-1"
+	fi
+}
+
+get_charge_enabled() {
+	if [[ -r "$CHARGING_ATTR" ]]; then
+		cat "$CHARGING_ATTR"
+	elif [[ -r "$SYS_USB/constant_charge_current_max" ]]; then
+		local ilim
+		ilim="$(cat "$SYS_USB/constant_charge_current_max")"
+		if [[ "$ilim" -eq 0 ]]; then echo "0"; else echo "1"; fi
+	else
+		echo "-1"
+	fi
+}
+
+get_online() {
+	if [[ -r "$SYS_USB/online" ]]; then
+		cat "$SYS_USB/online"
+	else
+		echo "1"
+	fi
+}
+
+set_charging() {
+	local enable="$1" # 1 to enable charging, 0 to disable / cut off
+	if [[ -w "$CHARGING_ATTR" ]]; then
+		echo "$enable" > "$CHARGING_ATTR"
+	elif [[ -w "$SYS_USB/constant_charge_current_max" ]]; then
+		if [[ "$enable" -eq 1 ]]; then
+			echo 1500000 > "$SYS_USB/constant_charge_current_max"
+		else
+			echo 0 > "$SYS_USB/constant_charge_current_max"
+		fi
+	else
+		echo "kenzo-batteryd: error: cannot write to charging control sysfs" >&2
+		return 1
+	fi
+}
+
+status() {
+	local cap st chg_en online v_now c_now
+	cap="$(get_capacity)"
+	st="$(cat "$SYS_BAT/status" 2>/dev/null || echo "Unknown")"
+	chg_en="$(get_charge_enabled)"
+	online="$(get_online)"
+	v_now="$(cat "$SYS_BAT/voltage_now" 2>/dev/null || echo "0")"
+	c_now="$(cat "$SYS_BAT/current_now" 2>/dev/null || echo "0")"
+
+	echo "== Kenzo Battery Threshold Manager =="
+	echo "Capacity:         ${cap}%"
+	echo "Status:           ${st}"
+	echo "Power Source:     $( [[ "$online" == "1" ]] && echo "USB Connected" || echo "Battery (USB Disconnected)" )"
+	echo "Charging State:   $( [[ "$chg_en" == "1" ]] && echo "ENABLED" || echo "CAPPED (USB Pass-Through)" )"
+	echo "Voltage:          $((v_now / 1000)) mV"
+	echo "Current:          $((c_now / 1000)) mA"
+	echo "Charge Cap:       ${STOP_THRESHOLD}% (resumes <= ${START_THRESHOLD}%)"
+}
+
+loop() {
+	echo "kenzo-batteryd started: charge capped at ${STOP_THRESHOLD}% (resumes <= ${START_THRESHOLD}%)"
+	local last_state="-1"
+
+	while true; do
+		# Reload configuration if modified
+		if [[ -f "$CONF" ]]; then
+			# shellcheck source=/dev/null
+			source "$CONF"
+		fi
+
+		STOP_THRESHOLD="${STOP_THRESHOLD:-60}"
+		START_THRESHOLD="${START_THRESHOLD:-$(( STOP_THRESHOLD - 2 ))}"
+		CHECK_INTERVAL_SEC="${CHECK_INTERVAL_SEC:-30}"
+
+		local cap chg_en online
+		cap="$(get_capacity)"
+		chg_en="$(get_charge_enabled)"
+		online="$(get_online)"
+
+		if [[ "$online" == "0" ]]; then
+			# Power is physically cut. Phone runs on battery.
+			# Ensure charging is enabled so PMIC immediately charges when power returns.
+			if [[ "$chg_en" != "1" ]]; then
+				set_charging 1 || true
+				last_state="1"
+			fi
+		elif [[ "$cap" -ge 0 ]]; then
+			if (( cap >= STOP_THRESHOLD )) && [[ "$chg_en" != "0" ]]; then
+				echo "kenzo-batteryd: battery reached ${cap}% (>= ${STOP_THRESHOLD}%). Capping charge at ${STOP_THRESHOLD}%; running on USB pass-through."
+				set_charging 0
+				last_state="0"
+			elif (( cap <= START_THRESHOLD )) && [[ "$chg_en" != "1" ]]; then
+				echo "kenzo-batteryd: battery at ${cap}% (<= ${START_THRESHOLD}%). Resuming charge up to ${STOP_THRESHOLD}%."
+				set_charging 1
+				last_state="1"
+			fi
+		fi
+
+		sleep "${CHECK_INTERVAL_SEC}"
+	done
+}
+
+case "${1:-loop}" in
+	loop|run)
+		loop
+		;;
+	status)
+		status
+		;;
+	enable|start-charge)
+		set_charging 1
+		echo "Battery charging enabled."
+		;;
+	disable|stop-charge)
+		set_charging 0
+		echo "Battery charging capped (USB pass-through active)."
+		;;
+	*)
+		echo "Usage: $0 {run|status|enable|disable}"
+		exit 1
+		;;
+esac

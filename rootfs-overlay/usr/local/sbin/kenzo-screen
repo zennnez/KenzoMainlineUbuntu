@@ -1,0 +1,273 @@
+#!/usr/bin/env bash
+# kenzo-screen: turn the phone screen completely on or off from userspace.
+#
+# On off:
+#   1. Inhibits touchscreen input devices to prevent phantom touch wakeups.
+#   2. Cuts off backlight power (bl_power=4, brightness=0).
+#   3. Powers down DSI panel via DRM KMS (fb0/blank=4 -> DPMS_OFF), which disables
+#      vsp/vsn power supplies, asserts reset GPIO, and enters panel sleep mode.
+#   4. Records state in /run/kenzo-screen.state.
+#
+# On on:
+#   1. Re-initializes DSI panel via DRM KMS (fb0/blank=0 -> DPMS_ON), which powers up
+#      vsp/vsn regulators, triggers panel hardware reset, sends MIPI-DSI DCS init
+#      commands, exits sleep mode, and re-inits display streaming.
+#   2. Restores backlight power (bl_power=0) and previous brightness.
+#   3. Uninhibits touchscreen input devices.
+#   4. Pokes console awake.
+
+set -euo pipefail
+
+STATE_FILE="/run/kenzo-screen.state"
+BRIGHTNESS_FILE="/run/kenzo-screen.brightness"
+BL_DIR="/sys/class/backlight"
+FB_BLANK="/sys/class/graphics/fb0/blank"
+
+bl_dev() {
+	local d
+	for d in "$BL_DIR"/*; do
+		[[ -e "$d/brightness" ]] && echo "$d" && return 0
+	done
+	return 1
+}
+
+# Inhibit or uninhibit all touchscreen input devices
+set_touchscreen_inhibited() {
+	local val="$1" # 1 to inhibit (disable), 0 to uninhibit (enable)
+	local d name
+	for d in /sys/class/input/input*; do
+		[[ -r "$d/name" ]] || continue
+		name="$(cat "$d/name" 2>/dev/null || true)"
+		case "$name" in
+			*ft5*|*touch*|*ts*|*mxt*|*synaptics*|*goodix*|*focaltech*)
+				if [[ -w "$d/inhibited" ]]; then
+					echo "$val" > "$d/inhibited" 2>/dev/null || true
+				fi
+				;;
+		esac
+	done
+}
+
+read_bl_max() {
+	local d="$1"
+	cat "$d/max_brightness" 2>/dev/null || echo 255
+}
+
+read_bl_cur() {
+	local d="$1"
+	cat "$d/brightness" 2>/dev/null || echo 0
+}
+
+screen_off() {
+	local d cur
+	d="$(bl_dev)" || true
+
+	# 1. Inhibit touchscreen to prevent stray touches / noise from waking console
+	set_touchscreen_inhibited 1
+
+	# 2. Backlight OFF
+	if [[ -n "$d" ]]; then
+		cur="$(read_bl_cur "$d")"
+		if (( cur > 0 )); then
+			echo "$cur" > "$BRIGHTNESS_FILE" 2>/dev/null || true
+		fi
+		[[ -w "$d/bl_power" ]] && echo 4 > "$d/bl_power" 2>/dev/null || true
+		echo 0 > "$d/brightness" 2>/dev/null || true
+	fi
+
+	# 3. DSI panel deep powerdown via DRM (FB_BLANK_POWERDOWN = 4)
+	# This calls drm_fb_helper_dpms(DRM_MODE_DPMS_OFF), which invokes the panel driver's
+	# unprepare() to disable vsp/vsn regulators, assert reset-gpio, and enter sleep mode.
+	if [[ -w "$FB_BLANK" ]]; then
+		echo 4 > "$FB_BLANK" 2>/dev/null || true
+	fi
+
+	# 4. Console blanking
+	[[ -c /dev/tty1 ]] && setterm -blank force </dev/tty1 >/dev/null 2>&1 || true
+
+	echo "off" > "$STATE_FILE"
+}
+
+screen_on() {
+	local d max target_bl
+	d="$(bl_dev)" || true
+
+	# 1. Re-initialize DSI panel via DRM (FB_BLANK_UNBLANK = 0)
+	# This calls drm_fb_helper_dpms(DRM_MODE_DPMS_ON), which invokes the panel driver's
+	# prepare() to enable vsp/vsn regulators, execute reset sequence, send DSI DCS init
+	# sequences, exit sleep mode, and start video streaming.
+	if [[ -w "$FB_BLANK" ]]; then
+		echo 0 > "$FB_BLANK" 2>/dev/null || true
+	fi
+
+	# 2. Backlight ON
+	if [[ -n "$d" ]]; then
+		max="$(read_bl_max "$d")"
+		target_bl=""
+		if [[ -f "$BRIGHTNESS_FILE" ]]; then
+			target_bl="$(cat "$BRIGHTNESS_FILE" 2>/dev/null || true)"
+		fi
+		if [[ -z "$target_bl" || "$target_bl" -le 0 ]]; then
+			target_bl="${SCREEN_ON_LEVEL:-$(( max > 0 ? max * 70 / 100 : 180 ))}"
+		fi
+		[[ -w "$d/bl_power" ]] && echo 0 > "$d/bl_power" 2>/dev/null || true
+		echo "$target_bl" > "$d/brightness" 2>/dev/null || true
+	fi
+
+	# 3. Uninhibit touchscreen
+	set_touchscreen_inhibited 0
+
+	# 4. Wake VT console
+	[[ -c /dev/tty1 ]] && setterm -blank poke </dev/tty1 >/dev/null 2>&1 || true
+
+	echo "on" > "$STATE_FILE"
+}
+
+is_screen_on() {
+	if [[ -f "$STATE_FILE" ]]; then
+		local st
+		st="$(cat "$STATE_FILE" 2>/dev/null || true)"
+		if [[ "$st" == "off" ]]; then echo "no"; return 0; fi
+		if [[ "$st" == "on" ]]; then echo "yes"; return 0; fi
+	fi
+
+	local d
+	d="$(bl_dev)" || true
+	if [[ -n "$d" ]]; then
+		local p cur
+		p="$(cat "$d/bl_power" 2>/dev/null || echo 0)"
+		cur="$(cat "$d/brightness" 2>/dev/null || echo 0)"
+		if (( p != 0 || cur <= 0 )); then
+			echo "no"
+			return 0
+		fi
+	fi
+	echo "yes"
+}
+
+set_font() {
+	local val="${1:-}"
+	local fonts=(
+		"Lat15-Terminus16.psf.gz"
+		"Lat15-Terminus20x10.psf.gz"
+		"Lat15-Terminus24x12.psf.gz"
+		"Lat15-Terminus28x14.psf.gz"
+		"Lat15-Terminus32x16.psf.gz"
+	)
+	local font_dir="/usr/share/consolefonts"
+	local font_state="/run/kenzo-font.idx"
+
+	if [[ -z "$val" ]]; then
+		local idx=2
+		[[ -f "$font_state" ]] && idx="$(cat "$font_state" 2>/dev/null || echo 2)"
+		echo "Current font: ${fonts[$idx]:-${fonts[2]}} (index $idx)"
+		return 0
+	fi
+
+	local chosen_font=""
+	local chosen_idx=2
+
+	case "$val" in
+		+|up|inc)
+			local cur=2
+			[[ -f "$font_state" ]] && cur="$(cat "$font_state" 2>/dev/null || echo 2)"
+			chosen_idx=$(( cur < ${#fonts[@]} - 1 ? cur + 1 : ${#fonts[@]} - 1 ))
+			chosen_font="${fonts[$chosen_idx]}"
+			;;
+		-|down|dec)
+			local cur=2
+			[[ -f "$font_state" ]] && cur="$(cat "$font_state" 2>/dev/null || echo 2)"
+			chosen_idx=$(( cur > 0 ? cur - 1 : 0 ))
+			chosen_font="${fonts[$chosen_idx]}"
+			;;
+		16|8x16)
+			chosen_idx=0
+			chosen_font="${fonts[0]}"
+			;;
+		20|10x20)
+			chosen_idx=1
+			chosen_font="${fonts[1]}"
+			;;
+		24|12x24)
+			chosen_idx=2
+			chosen_font="${fonts[2]}"
+			;;
+		28|14x28)
+			chosen_idx=3
+			chosen_font="${fonts[3]}"
+			;;
+		32|16x32)
+			chosen_idx=4
+			chosen_font="${fonts[4]}"
+			;;
+		*)
+			if [[ -f "$val" ]]; then
+				chosen_font="$val"
+			elif [[ -f "${font_dir}/${val}" ]]; then
+				chosen_font="${font_dir}/${val}"
+			elif [[ -f "${font_dir}/${val}.psf.gz" ]]; then
+				chosen_font="${font_dir}/${val}.psf.gz"
+			else
+				local match
+				match="$(ls "${font_dir}"/*"$val"*.psf.gz 2>/dev/null | head -n 1 || true)"
+				if [[ -n "$match" && -f "$match" ]]; then
+					chosen_font="$match"
+				else
+					echo "Unknown font size or font: $val" >&2
+					echo "Valid sizes: 16 (8x16), 20 (10x20), 24 (12x24), 28 (14x28), 32 (16x32), or +/-" >&2
+					return 1
+				fi
+			fi
+			;;
+	esac
+
+	local target_path="$chosen_font"
+	[[ "$target_path" != /* ]] && target_path="${font_dir}/${chosen_font}"
+
+	if [[ -f "$target_path" ]]; then
+		if [[ -c /dev/tty1 ]]; then
+			setfont -C /dev/tty1 "$target_path" 2>/dev/null || setfont "$target_path" 2>/dev/null || true
+		else
+			setfont "$target_path" 2>/dev/null || true
+		fi
+		echo "$chosen_idx" > "$font_state" 2>/dev/null || true
+		echo "Font set to $(basename "$target_path")"
+	else
+		echo "Font file not found: $target_path" >&2
+		return 1
+	fi
+}
+
+mode="${1:-toggle}"
+case "$mode" in
+	on)
+		screen_on
+		;;
+	off)
+		screen_off
+		;;
+	reinit|reload)
+		screen_off
+		sleep 0.2
+		screen_on
+		;;
+	toggle)
+		if [[ "$(is_screen_on)" == "yes" ]]; then
+			screen_off
+		else
+			screen_on
+		fi
+		;;
+	status|is_screen_on)
+		is_screen_on
+		;;
+	font|fontsize|setfont)
+		shift || true
+		set_font "${1:-}"
+		;;
+	*)
+		echo "usage: $0 [on|off|toggle|reinit|status|font [size]]" >&2
+		exit 1
+		;;
+esac
+

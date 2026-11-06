@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Expand root filesystem to fill partition on first boot
+if [[ ! -f /etc/.kenzo-resized ]]; then
+    ROOT_DEV="$(findmnt -n -o SOURCE / 2>/dev/null)"
+    if [[ -b "$ROOT_DEV" ]] && resize2fs "$ROOT_DEV" >/dev/null 2>&1; then
+        touch /etc/.kenzo-resized 2>/dev/null || true
+    else
+        echo "kenzo-screen-banner: WARNING: resize2fs of '${ROOT_DEV:-?}' failed, will retry next boot" >&2
+    fi
+fi
+
+# Wait up to 10s for Wi-Fi or USB IP
+for i in {1..10}; do
+    ip4=$(ip -4 -br addr show dev wlan0 2>/dev/null | awk '{print $3}')
+    usb=$(ip -4 -br addr show dev usb0 2>/dev/null | awk '{print $3}')
+    [[ -n "$ip4" || -n "$usb" ]] && break
+    sleep 1
+done
+
+# Ensure default console font is 24 on boot
+if command -v kenzo-screen >/dev/null 2>&1; then
+    kenzo-screen font 24 >/dev/null 2>&1 || true
+fi
+
+# The banner is fastfetch itself: the Wi-Fi band, the SSH commands and Bluetooth are modules of
+# /etc/fastfetch/config.jsonc, so there is nothing else to print here.
+if command -v fastfetch >/dev/null 2>&1; then
+    # tty1 normally runs the tmux session "kenzo" (see kenzo-cmd): redraw the banner inside it, now that
+    # the network is up. Without a session (or when something else is in front) print it straight to tty1.
+    if ! { command -v kenzo-cmd >/dev/null 2>&1 && kenzo-cmd banner --wait 15 2>/dev/null; }; then
+        if [[ -c /dev/tty1 ]]; then
+            clear > /dev/tty1 2>/dev/null || true
+            fastfetch --pipe false > /dev/tty1 2>&1 || true
+            echo "" > /dev/tty1 2>/dev/null || true
+        fi
+    fi
+fi

@@ -1,0 +1,433 @@
+#!/usr/bin/env bash
+# kenzo-wifi-band - prefer 5 GHz Wi-Fi over 2.4 GHz.
+#
+#   kenzo-wifi-band status            band/regulatory state, known networks, what it would do
+#   kenzo-wifi-band apply [options]   set the regulatory country, rank the profiles (5 GHz first),
+#                                     and move from 2.4 GHz to a usable 5 GHz network if there is one
+#        --dry-run                    only say what would happen
+#        --force                      ignore the SSH guard, cooldowns and the 60 s rate limit
+#   kenzo-wifi-band regdom            only set the regulatory country (runs before NetworkManager)
+#
+# Why a country matters: with the world regulatory domain most 5 GHz channels are passive/no-IR, so a
+# 5 GHz access point on channel 149+ (typical in India) is never found or never joined.
+# Config: /etc/kenzo-wifi-band.conf. Needs root (nmcli, iw).
+set -u
+
+CONF=${KENZO_WIFI_BAND_CONF:-/etc/kenzo-wifi-band.conf}
+STATE=${KENZO_WIFI_BAND_STATE:-/run/kenzo-wifi-band}
+TESTDIR=${KENZO_WIFI_BAND_TEST:-}          # fixtures dir: read inputs from files, only log the actions
+PREFER_5G=1; COUNTRY=""; MIN_SIGNAL_5G=45; MAX_DEFICIT=25; COOLDOWN=1800; RESPECT_SSH=1; IFACE=""; PRIO_5G=10; RESCAN_INTERVAL=1800
+DRY=0; FORCE=0
+
+log()  { echo "kenzo-wifi-band: $*" >&2; }
+act()  { if [[ -n $TESTDIR ]]; then echo "$*" >> "$TESTDIR/actions.log"; fi; }
+is_int() { [[ ${1:-} =~ ^[0-9]+$ ]]; }
+now()  { if [[ -n $TESTDIR && -r $TESTDIR/now ]]; then cat "$TESTDIR/now"; else date +%s; fi; }
+
+# ---------------------------------------------------------------- config
+load_conf() {
+  [[ -r $CONF ]] || return 0
+  local P=$PREFER_5G C=$COUNTRY S=$MIN_SIGNAL_5G D=$MAX_DEFICIT K=$COOLDOWN R=$RESPECT_SSH I=$IFACE Q=$PRIO_5G W=$RESCAN_INTERVAL
+  ( . "$CONF" ) >/dev/null 2>&1 || { log "config $CONF is not valid shell; using defaults"; return 1; }
+  . "$CONF"
+  if ! is_int "$PREFER_5G" || ! is_int "$MIN_SIGNAL_5G" || ! is_int "$MAX_DEFICIT" || ! is_int "$COOLDOWN" \
+     || ! is_int "$RESPECT_SSH" || ! is_int "$PRIO_5G" || ! is_int "$RESCAN_INTERVAL" || (( MIN_SIGNAL_5G > 100 )) \
+     || [[ -n $COUNTRY && ! $COUNTRY =~ ^[A-Za-z]{2}$ ]]; then
+    log "invalid value in $CONF; keeping the previous/default settings"
+    PREFER_5G=$P; COUNTRY=$C; MIN_SIGNAL_5G=$S; MAX_DEFICIT=$D; COOLDOWN=$K; RESPECT_SSH=$R; IFACE=$I; PRIO_5G=$Q; RESCAN_INTERVAL=$W
+    return 1
+  fi
+  COUNTRY=${COUNTRY^^}
+  return 0
+}
+
+# ---------------------------------------------------------------- inputs (each has a fixture branch for tests)
+detect_iface() {
+  [[ -n $IFACE ]] && return 0
+  if [[ -n $TESTDIR ]]; then IFACE=wlan0; return 0; fi
+  local d
+  for d in /sys/class/net/*/wireless; do [[ -d $d ]] && { IFACE=$(basename "$(dirname "$d")"); return 0; }; done
+  return 1
+}
+
+iw_link()  { if [[ -n $TESTDIR ]]; then cat "$TESTDIR/iw_link.txt" 2>/dev/null; else iw dev "$IFACE" link 2>/dev/null; fi; }
+reg_get()  { if [[ -n $TESTDIR ]]; then cat "$TESTDIR/reg_get.txt" 2>/dev/null; else iw reg get 2>/dev/null; fi; }
+iw_list()  { if [[ -n $TESTDIR ]]; then cat "$TESTDIR/iw_list.txt" 2>/dev/null; else iw list 2>/dev/null; fi; }
+tz_name()  { if [[ -n $TESTDIR ]]; then cat "$TESTDIR/timezone" 2>/dev/null; else timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null; fi; }
+zone_tab() { if [[ -n $TESTDIR ]]; then echo "$TESTDIR/zone.tab"; else echo /usr/share/zoneinfo/zone.tab; fi; }
+
+scan_cached() {  # prints "BSSID|FREQ|SIGNAL|SSID" from NetworkManager's cached scan list
+  if [[ -n $TESTDIR ]]; then cat "$TESTDIR/scan.txt" 2>/dev/null; return; fi
+  local line bssid rest freq sig ssid
+  nmcli --escape no -t -f BSSID,FREQ,SIGNAL,SSID device wifi list ifname "$IFACE" --rescan no 2>/dev/null | while IFS= read -r line; do
+    bssid=${line:0:17}; rest=${line:18}
+    freq=${rest%%:*}; rest=${rest#*:}; freq=${freq%% *}
+    sig=${rest%%:*};  ssid=${rest#*:}
+    if [[ $bssid =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]] && is_int "$freq" && is_int "$sig"; then echo "$bssid|$freq|$sig|$ssid"; fi
+  done
+}
+scan_fresh() {   # same, after asking for a new scan
+  if [[ -n $TESTDIR ]]; then cat "$TESTDIR/scan.txt" 2>/dev/null; return; fi
+  nmcli device wifi rescan ifname "$IFACE" >/dev/null 2>&1; sleep 6
+  scan_cached
+}
+
+profiles() {     # prints "UUID|SSID|BAND|AUTOCONNECT|PRIORITY" for every Wi-Fi profile
+  if [[ -n $TESTDIR ]]; then cat "$TESTDIR/profiles.txt" 2>/dev/null; return; fi
+  local uuid type ssid band auto prio
+  nmcli -t -f UUID,TYPE connection show 2>/dev/null | while IFS=: read -r uuid type; do
+    [[ $type == 802-11-wireless || $type == wifi ]] || continue
+    ssid=$(nmcli -g 802-11-wireless.ssid connection show uuid "$uuid" 2>/dev/null)
+    band=$(nmcli -g 802-11-wireless.band connection show uuid "$uuid" 2>/dev/null)
+    auto=$(nmcli -g connection.autoconnect connection show uuid "$uuid" 2>/dev/null)
+    prio=$(nmcli -g connection.autoconnect-priority connection show uuid "$uuid" 2>/dev/null)
+    echo "$uuid|$ssid|$band|$auto|${prio:-0}"
+  done
+}
+
+ssh_active() {   # 0 when an SSH session uses a non-USB path (a Wi-Fi switch would cut it)
+  if [[ -n $TESTDIR ]]; then [[ -e $TESTDIR/ssh_active ]]; return; fi
+  local usbip la
+  usbip=$(ip -4 -br addr show dev usb0 2>/dev/null | awk '{print $3}' | cut -d/ -f1)
+  while read -r la; do
+    la=${la%:*}
+    if [[ -n $la && $la != "$usbip" && $la != 127.* ]]; then return 0; fi
+  done < <(ss -Htn state established '( sport = :22 )' 2>/dev/null | awk '{print $3}')
+  return 1
+}
+
+# ---------------------------------------------------------------- helpers
+dbm_to_pct() { local p=$(( 2 * ($1 + 100) )); (( p < 0 )) && p=0; (( p > 100 )) && p=100; echo "$p"; }
+band_of()    { local f=$1; if (( f >= 4900 )); then echo 5; else echo 2; fi; }
+chan_of()    { local f=$1; if (( f == 2484 )); then echo 14; elif (( f < 3000 )); then echo $(( (f - 2407) / 5 )); else echo $(( (f - 5000) / 5 )); fi; }
+key_of()     { echo "${1//[^A-Za-z0-9]/_}"; }
+
+cool_set() { mkdir -p "$STATE" 2>/dev/null; echo $(( $(now) + COOLDOWN )) > "$STATE/cool.$(key_of "$1")" 2>/dev/null; }
+cool_on()  { local f t; f="$STATE/cool.$(key_of "$1")"; [[ -r $f ]] || return 1; t=$(cat "$f"); is_int "$t" && (( $(now) < t )); }
+
+link_info() {    # sets L_CONNECTED L_BSSID L_SSID L_FREQ L_DBM L_PCT ; returns 1 when not connected
+  local l; l=$(iw_link)
+  L_CONNECTED=0; L_BSSID=""; L_SSID=""; L_FREQ=0; L_DBM=""; L_PCT=0
+  [[ $l == *"Connected to"* ]] || return 1
+  L_CONNECTED=1
+  L_BSSID=$(sed -n 's/^Connected to \([0-9A-Fa-f:]*\).*/\1/p' <<<"$l" | head -1)
+  L_SSID=$(sed -n 's/^[[:space:]]*SSID: //p' <<<"$l" | head -1)
+  L_FREQ=$(sed -n 's/^[[:space:]]*freq: \([0-9]*\).*/\1/p' <<<"$l" | head -1); L_FREQ=${L_FREQ:-0}
+  L_DBM=$(sed -n 's/^[[:space:]]*signal: \(-\{0,1\}[0-9]*\).*/\1/p' <<<"$l" | head -1)
+  if [[ -n $L_DBM ]]; then L_PCT=$(dbm_to_pct "$L_DBM"); fi
+  return 0
+}
+
+# ---------------------------------------------------------------- regulatory domain
+country_wanted() {
+  if [[ -n $COUNTRY ]]; then echo "$COUNTRY"; return 0; fi
+  local tz cc; tz=$(tz_name)
+  [[ -n $tz ]] || return 1
+  cc=$(awk -v tz="$tz" '$1 !~ /^#/ && $3 == tz { print $1; exit }' "$(zone_tab)" 2>/dev/null)
+  if [[ $cc =~ ^[A-Z]{2}$ ]]; then echo "$cc"; return 0; fi
+  return 1
+}
+country_active() { reg_get | sed -n 's/^country \([A-Z0-9][A-Z0-9]\).*/\1/p' | head -1; }
+
+cmd_regdom() {
+  local want have
+  want=$(country_wanted) || { log "no country known: set COUNTRY= in $CONF (5 GHz channels stay restricted until then)"; return 0; }
+  have=$(country_active)
+  [[ $have == "$want" ]] && return 0
+  if (( DRY )); then echo "would set regulatory country $want (now: ${have:-unknown})"; return 0; fi
+  if [[ -n $TESTDIR ]]; then act "regdom $want"; return 0; fi
+  iw reg set "$want" 2>/dev/null || { log "iw reg set $want failed"; return 1; }
+  sleep 1
+  have=$(country_active)
+  if [[ $have == "$want" ]]; then log "regulatory country set to $want"
+  else log "regulatory country is '$have' after asking for $want (is wireless-regdb installed?)"; return 1; fi
+}
+
+five_channels() { iw_list | awk '/\* 5[0-9][0-9][0-9](\.[0-9])? MHz/ && !/disabled/ {n++} END{print n+0}'; }
+
+# ---------------------------------------------------------------- ranking + upgrade
+classify() {     # SSID BAND_CFG SCANDATA -> 5 | 2 | mixed | unknown
+  local ssid=$1 bcfg=$2 scan=$3 f s n2=0 n5=0
+  if [[ $bcfg == a ]]; then echo 5; return; fi
+  if [[ $bcfg == bg ]]; then echo 2; return; fi
+  while IFS='|' read -r _ f _ s; do
+    [[ $s == "$ssid" ]] || continue
+    if (( f >= 4900 )); then n5=$((n5 + 1)); else n2=$((n2 + 1)); fi
+  done <<<"$scan"
+  if (( n5 > 0 && n2 == 0 )); then echo 5
+  elif (( n2 > 0 && n5 == 0 )); then echo 2
+  elif (( n2 > 0 && n5 > 0 )); then echo mixed
+  elif [[ $ssid =~ (^|[^A-Za-z0-9])5\ ?G(Hz|hz)?([^A-Za-z0-9]|$) ]]; then echo 5      # name hint, only when nothing is visible
+  else echo unknown; fi
+}
+
+rank_profiles() {  # SCANDATA
+  local scan=$1 uuid ssid band auto prio cls want
+  while IFS='|' read -r uuid ssid band auto prio; do
+    [[ -n $uuid && $auto != no ]] || continue
+    # only touch priorities that are still ours (0 or PRIO_5G); never override a value you set yourself
+    [[ $prio == 0 || $prio == "$PRIO_5G" ]] || continue
+    cls=$(classify "$ssid" "$band" "$scan")
+    want=0; [[ $cls == 5 ]] && want=$PRIO_5G
+    cool_on "ssid:$ssid" && want=0
+    [[ $prio == "$want" ]] && continue
+    if (( DRY )); then echo "would set autoconnect-priority of '$ssid' ($cls) to $want"; continue; fi
+    if [[ -n $TESTDIR ]]; then act "priority $uuid $want"; continue; fi
+    if nmcli connection modify uuid "$uuid" connection.autoconnect-priority "$want" >/dev/null 2>&1; then
+      log "'$ssid' ($cls): autoconnect-priority $prio -> $want"
+    else log "could not change the priority of '$ssid'"; fi
+  done < <(profiles)
+}
+
+verify_5g() {    # waits up to 25 s for a 5 GHz link on the given SSID
+  local want_ssid=$1 i
+  if [[ -n $TESTDIR ]]; then [[ ${KENZO_TEST_VERIFY:-ok} == ok ]]; return; fi
+  for (( i = 0; i < 25; i++ )); do
+    if link_info && (( $(band_of "$L_FREQ") == 5 )) && [[ -z $want_ssid || $L_SSID == "$want_ssid" ]]; then return 0; fi
+    sleep 1
+  done
+  return 1
+}
+
+upgrade() {      # SCANDATA ; link_info must be current
+  local scan=$1 bssid f sig ssid best="" best_sig=-1 best_f=0 best_ssid="" cur_uuid="" known="" uuid s2 band auto prio
+  while IFS='|' read -r uuid s2 band auto prio; do
+    [[ -n $uuid && -n $s2 && $auto != no ]] || continue
+    known+="$s2"$'\n'
+    [[ $s2 == "$L_SSID" && -z $cur_uuid ]] && cur_uuid=$uuid
+  done < <(profiles)
+  while IFS='|' read -r bssid f sig ssid; do
+    [[ -n $bssid && -n $ssid ]] || continue   # hidden networks (empty SSID) can never match a saved profile
+    (( f >= 4900 )) || continue
+    grep -qxF -- "$ssid" <<<"$known" || continue
+    (( sig >= MIN_SIGNAL_5G )) || continue
+    (( sig + MAX_DEFICIT >= L_PCT )) || continue
+    if (( ! FORCE )); then
+      cool_on "bssid:$bssid" && continue
+      [[ $ssid != "$L_SSID" ]] && cool_on "ssid:$ssid" && continue
+    fi
+    if (( sig > best_sig )); then best=$bssid; best_sig=$sig; best_f=$f; best_ssid=$ssid; fi
+  done <<<"$scan"
+  if [[ -z $best ]]; then
+    echo "no usable 5 GHz network (needs >= ${MIN_SIGNAL_5G}% and within ${MAX_DEFICIT} points of the current ${L_PCT}%)"; return 0
+  fi
+  echo "5 GHz candidate: '$best_ssid' $best ch$(chan_of "$best_f") ${best_sig}% (current: $L_SSID $(band_of "$L_FREQ") GHz ${L_PCT}%)"
+  if (( DRY )); then echo "dry run: would switch"; return 0; fi
+  if (( ! FORCE )) && (( RESPECT_SSH )) && ssh_active; then
+    log "an SSH session is active over Wi-Fi: not switching now (use 'apply --force', or retry when idle)"; return 0
+  fi
+  if [[ $best_ssid == "$L_SSID" ]]; then
+    log "roaming to $best (same network, 5 GHz)"
+    if [[ -n $TESTDIR ]]; then act "roam $best"
+    elif ! wpa_cli -p /run/wpa_supplicant -i "$IFACE" roam "$best" >/dev/null 2>&1; then
+      log "wpa_cli roam failed; backing off for ${COOLDOWN}s"; cool_set "bssid:$best"; return 1
+    fi
+    if ! verify_5g "$best_ssid"; then log "did not end up on 5 GHz; backing off for ${COOLDOWN}s"; cool_set "bssid:$best"; return 1; fi
+  else
+    local newuuid="" u3 s3 b3 a3 p3
+    while IFS='|' read -r u3 s3 b3 a3 p3; do
+      if [[ $s3 == "$best_ssid" && $a3 != no ]]; then newuuid=$u3; break; fi
+    done < <(profiles)
+    [[ -n $newuuid ]] || { log "no profile for '$best_ssid'"; return 1; }
+    log "switching '$L_SSID' -> '$best_ssid' (5 GHz)"
+    if [[ -n $TESTDIR ]]; then act "up $newuuid"
+    else nmcli connection up uuid "$newuuid" ifname "$IFACE" >/dev/null 2>&1 || true; fi
+    if ! verify_5g "$best_ssid"; then
+      log "5 GHz network '$best_ssid' did not come up; going back to '$L_SSID' and backing off for ${COOLDOWN}s"
+      cool_set "ssid:$best_ssid"; cool_set "bssid:$best"
+      if [[ -n $TESTDIR ]]; then act "up ${cur_uuid:-none}"
+      elif [[ -n $cur_uuid ]]; then nmcli connection up uuid "$cur_uuid" ifname "$IFACE" >/dev/null 2>&1 || nmcli device connect "$IFACE" >/dev/null 2>&1
+      else nmcli device connect "$IFACE" >/dev/null 2>&1; fi
+      return 1
+    fi
+  fi
+  log "now on 5 GHz"
+  return 0
+}
+
+recover_link() {
+  local offline_file="$STATE/offline_since" now_ts
+  now_ts=$(now)
+  if [[ ! -r "$offline_file" ]]; then
+    echo "$now_ts" > "$offline_file" 2>/dev/null || true
+  fi
+
+  local offline_start
+  offline_start=$(cat "$offline_file" 2>/dev/null || echo "$now_ts")
+  local offline_dur=$(( now_ts - offline_start ))
+
+  log "Wi-Fi is disconnected (offline for ${offline_dur}s); attempting auto-reconnect..."
+
+  # 1. Ensure radio is unblocked and enabled
+  if command -v rfkill >/dev/null 2>&1; then
+    if rfkill list wifi 2>/dev/null | grep -qi "yes"; then
+      log "unblocking rfkill wifi"
+      rfkill unblock wifi 2>/dev/null || true
+    fi
+  fi
+  if nmcli radio wifi 2>/dev/null | grep -qi "disabled"; then
+    log "enabling Wi-Fi radio"
+    nmcli radio wifi on 2>/dev/null || true
+  fi
+
+  # 2. Tell NetworkManager to connect on interface (let NM handle retries without disruptive radio toggling)
+  nmcli device connect "$IFACE" >/dev/null 2>&1 || true
+
+  # 3. If still not connected, find the best visible known profile and activate it
+  if ! link_info; then
+    local scan best_uuid="" best_prio=-1 uuid ssid band auto prio
+    scan=$(scan_cached)
+
+    while IFS='|' read -r uuid ssid band auto prio; do
+      [[ -n $uuid && -n $ssid && $auto != no ]] || continue
+      if grep -qF "|$ssid" <<<"$scan"; then
+        if (( prio > best_prio )); then
+          best_prio=$prio
+          best_uuid=$uuid
+        fi
+      fi
+    done < <(profiles)
+
+    if [[ -n "$best_uuid" ]]; then
+      log "activating known profile $best_uuid"
+      nmcli connection up uuid "$best_uuid" ifname "$IFACE" >/dev/null 2>&1 || true
+    fi
+  fi
+
+  if link_info; then
+    rm -f "$offline_file" 2>/dev/null || true
+    log "reconnected to $L_SSID ($L_FREQ MHz, ${L_DBM} dBm)"
+    return 0
+  else
+    log "still not connected (AP may still be offline/rebooting)"
+    return 1
+  fi
+}
+
+check_gateway() {
+  # Skip gateway ping checks during early boot (< 90s uptime) to prevent false resets
+  local uptime_sec=0
+  if [[ -r /proc/uptime ]]; then
+    uptime_sec=$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)
+  fi
+  if (( uptime_sec < 90 )); then
+    return 0
+  fi
+
+  local gw
+  gw=$(ip -4 route show default dev "$IFACE" 2>/dev/null | awk '{print $3; exit}')
+  [[ -n "$gw" ]] || return 0
+
+  # Quick 1-second ping probe
+  if ping -c 1 -W 1 "$gw" >/dev/null 2>&1; then
+    rm -f "$STATE/gw_fail" 2>/dev/null || true
+    rm -f "$STATE/offline_since" 2>/dev/null || true
+    return 0
+  fi
+
+  local gw_fail_file="$STATE/gw_fail" count=1
+  if [[ -r "$gw_fail_file" ]]; then
+    count=$(cat "$gw_fail_file" 2>/dev/null || echo 1)
+    count=$(( count + 1 ))
+  fi
+  echo "$count" > "$gw_fail_file" 2>/dev/null || true
+
+  log "gateway $gw did not answer ping (failure #$count)"
+  if (( count >= 3 )); then
+    log "gateway unreachable for 3 consecutive checks; refreshing connection"
+    rm -f "$gw_fail_file" 2>/dev/null || true
+    nmcli device reapply "$IFACE" >/dev/null 2>&1 || nmcli device connect "$IFACE" >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
+cmd_apply() {
+  local scan stamp last
+  detect_iface || { log "no wireless interface"; return 0; }
+  cmd_regdom
+  mkdir -p "$STATE" 2>/dev/null
+
+  # Non-blocking concurrency lock: only one apply instance runs at a time
+  exec 200>"$STATE/apply.lock" || true
+  if command -v flock >/dev/null 2>&1; then
+    flock -n 200 || { log "apply already running; skipping"; return 0; }
+  fi
+
+  if ! link_info; then
+    recover_link
+    return $?
+  fi
+
+  # Connection is active: verify gateway health
+  check_gateway
+
+  (( PREFER_5G )) || { echo "PREFER_5G=0: nothing to do"; return 0; }
+  scan=$(scan_cached)
+  rank_profiles "$scan"
+  if (( $(band_of "$L_FREQ") == 5 )); then echo "already on 5 GHz ($L_SSID, ch$(chan_of "$L_FREQ"), ${L_DBM} dBm)"; return 0; fi
+  stamp="$STATE/last-scan"
+  if (( ! FORCE )) && (( ! DRY )) && [[ -r $stamp ]]; then
+    last=$(cat "$stamp" 2>/dev/null); is_int "$last" || last=0
+    if (( $(now) - last < 60 )); then echo "checked less than 60 s ago"; return 0; fi
+  fi
+  (( DRY )) || now > "$stamp" 2>/dev/null
+  # A forced scan takes the radio off-channel for a second or more (on the WCN3660B that stalls traffic and
+  # can drop SSH). So: no forced scan while an SSH session runs over Wi-Fi, and when nothing 5 GHz is known
+  # only look again every RESCAN_INTERVAL seconds. NetworkManager keeps refreshing the cached list on its own.
+  local fresh=$scan rs="$STATE/last-rescan" lr=0
+  if (( ! FORCE )) && (( ! DRY )) && (( RESPECT_SSH )) && ssh_active; then
+    log "SSH session active over Wi-Fi: not scanning now, using the cached scan list"
+  else
+    [[ -r $rs ]] && lr=$(cat "$rs" 2>/dev/null); is_int "$lr" || lr=0
+    if (( FORCE )) || (( DRY )) || (( $(now) - lr >= RESCAN_INTERVAL )); then
+      (( DRY )) || now > "$rs" 2>/dev/null
+      fresh=$(scan_fresh)
+    fi
+  fi
+  [[ $fresh != "$scan" ]] && rank_profiles "$fresh"
+  upgrade "$fresh"
+}
+
+cmd_status() {
+  local scan uuid ssid band auto prio cls bssid f sig s known
+  detect_iface || { echo "no wireless interface"; return 1; }
+  echo "interface:   $IFACE"
+  echo "country:     wanted=$(country_wanted || echo '(unset)')  active=$(country_active)"
+  echo "5 GHz:       $(five_channels) usable channel(s) reported by the driver"
+  if link_info; then
+    echo "link:        $L_SSID  $(band_of "$L_FREQ") GHz ch$(chan_of "$L_FREQ")  ${L_DBM} dBm (${L_PCT}%)  $L_BSSID"
+  else echo "link:        not connected"; fi
+  scan=$(scan_cached)
+  echo "profiles:"
+  while IFS='|' read -r uuid ssid band auto prio; do
+    [[ -n $uuid ]] || continue
+    cls=$(classify "$ssid" "$band" "$scan")
+    printf '  %-24s class=%-8s priority=%-3s autoconnect=%s\n' "$ssid" "$cls" "$prio" "${auto:-?}"
+  done < <(profiles)
+  echo "visible (known SSIDs only):"
+  known=$(profiles | cut -d'|' -f2)
+  while IFS='|' read -r bssid f sig s; do
+    [[ -n $bssid ]] || continue
+    grep -qxF -- "$s" <<<"$known" || continue
+    printf '  %-24s %s GHz ch%-3s %3s%%  %s\n' "$s" "$(band_of "$f")" "$(chan_of "$f")" "$sig" "$bssid"
+  done <<<"$scan"
+  echo "decision:"
+  DRY=1; cmd_apply | sed 's/^/  /'
+}
+
+# ---------------------------------------------------------------- main
+cmd=${1:-}; shift || true
+for a in "$@"; do
+  case "$a" in
+    --dry-run) DRY=1 ;;
+    --force)   FORCE=1 ;;
+    *) echo "unknown option $a" >&2; exit 2 ;;
+  esac
+done
+load_conf
+case "$cmd" in
+  status) cmd_status ;;
+  apply)  cmd_apply ;;
+  regdom) detect_iface; cmd_regdom ;;
+  *) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

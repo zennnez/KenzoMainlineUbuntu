@@ -1,0 +1,62 @@
+{
+    "$schema": "https://github.com/fastfetch-cli/fastfetch/raw/dev/doc/json_schema.json",
+    "modules": [
+        "title",
+        "separator",
+        "os",
+        "host",
+        "kernel",
+        "uptime",
+        "packages",
+        "shell",
+        "display",
+        {
+            "type": "cpu",
+            "format": "Qualcomm Snapdragon 650 (MSM8956) ({3}) @ {7}"
+        },
+        {
+            "type": "gpu",
+            "format": "Qualcomm Adreno 510"
+        },
+        "memory",
+        "swap",
+        "disk",
+        "localip",
+        "battery",
+        {
+            "type": "custom",
+            "format": "---------------- Access ----------------"
+        },
+        {
+            "type": "command",
+            "key": "Wi-Fi",
+            "text": "/usr/local/bin/kenzo-ssh --field wifi"
+        },
+        {
+            "type": "command",
+            "key": "SSH (Wi-Fi)",
+            "text": "/usr/local/bin/kenzo-ssh --field ssh-wifi"
+        },
+        {
+            "type": "command",
+            "key": "SSH (USB)",
+            "text": "/usr/local/bin/kenzo-ssh --field ssh-usb"
+        },
+        {
+            "type": "command",
+            "key": "SSH (name)",
+            "text": "/usr/local/bin/kenzo-ssh --field ssh-name"
+        },
+        {
+            "type": "command",
+            "key": "SSH (Tailscale)",
+            "text": "/usr/local/bin/kenzo-ssh --field ssh-tailscale"
+        },
+        {
+            "type": "command",
+            "key": "Bluetooth",
+            "text": "/usr/local/bin/kenzo-ssh --field bluetooth"
+        },
+        "locale"
+    ]
+}

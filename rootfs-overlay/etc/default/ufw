@@ -1,0 +1,33 @@
+# /etc/default/ufw
+# Set to yes to apply rules to support IPv6 (requires kernel IPv6 netfilter match extensions)
+IPV6=no
+
+# Set the default input policy to ACCEPT, DROP, or REJECT. Please note that if
+# you change the default policy you will probably also want to adjust your
+# rules
+DEFAULT_INPUT_POLICY="DROP"
+
+# Set the default output policy to ACCEPT, DROP, or REJECT. Please note that if
+# you change the default policy you will probably also want to adjust your
+# rules
+DEFAULT_OUTPUT_POLICY="ACCEPT"
+
+# Set the default forward policy to ACCEPT, DROP, or REJECT.  Please note that
+# if you change the default policy you will probably also want to adjust your
+# rules
+DEFAULT_FORWARD_POLICY="DROP"
+
+# Set the default application policy to ACCEPT, DROP, REJECT or SKIP. Please
+# note that setting this to ACCEPT can be a security risk. See ufw(8) for
+# details
+DEFAULT_APPLICATION_POLICY="SKIP"
+
+# By default, ufw manages its firewall chains and will not manage other
+# chains. Change to yes to manage built-in chains
+MANAGE_BUILTINS=no
+
+# IPT_SYSCTL is typically used to enable forwarding with IPv4/IPv6, etc
+IPT_SYSCTL=/etc/ufw/sysctl.conf
+
+# Extra options to pass to iptables-restore. Default is blank
+IPT_MODULES=""

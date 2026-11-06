@@ -1,0 +1,10 @@
+#!/bin/sh
+# NetworkManager dispatcher: when Wi-Fi comes up, check whether 5 GHz is available.
+# NEVER run on 'down' or 'dhcp4-change' -- doing so creates an infinite loop with recovery actions.
+iface="$1"; action="$2"
+case "$action" in
+    up)
+        case "$iface" in wlan*|wlp*) systemctl start --no-block kenzo-wifi-band.service >/dev/null 2>&1 ;; esac ;;
+esac
+exit 0
+

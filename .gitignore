@@ -1,0 +1,8 @@
+out/
+boot.img
+recovery.img
+.env
+.env.*
+!.env.example
+*.bak
+*.bak.*

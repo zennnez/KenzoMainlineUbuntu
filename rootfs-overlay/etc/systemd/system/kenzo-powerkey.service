@@ -1,0 +1,22 @@
+[Unit]
+Description=Kenzo power key -> screen on/off toggle
+After=systemd-modules-load.service local-fs.target systemd-udevd.service sysinit.target
+Wants=systemd-udevd.service
+ConditionPathExists=/usr/local/sbin/kenzo-keysd
+ConditionPathIsDirectory=/dev/input
+
+[Service]
+Type=simple
+ExecStartPre=/bin/sleep 1
+ExecStart=/usr/local/sbin/kenzo-keysd
+Restart=on-failure
+RestartSec=3
+RestartPreventExitStatus=2 3 4
+Group=input
+SupplementaryGroups=video render
+StandardOutput=journal
+StandardError=journal
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target

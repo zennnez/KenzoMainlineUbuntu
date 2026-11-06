@@ -1,0 +1,328 @@
+#!/usr/bin/env bash
+# kenzo-bt: diagnose, control, and pair Bluetooth devices (BlueZ / WCN3660B).
+#   kenzo-bt status                 show Bluetooth power, adapter info, and connected devices
+#   kenzo-bt on                     turn Bluetooth on (rfkill unblock + bluetoothctl power on)
+#   kenzo-bt off                    turn Bluetooth off (bluetoothctl power off + rfkill block)
+#   kenzo-bt scan [sec]             scan for nearby Bluetooth devices (default: 10s)
+#   kenzo-bt devices                list paired and known Bluetooth devices
+#   kenzo-bt pair [MAC]             pair and trust a Bluetooth device (with auto-agent)
+#   kenzo-bt connect [MAC]          connect to a paired Bluetooth device
+#   kenzo-bt disconnect [MAC]       disconnect a Bluetooth device
+#   kenzo-bt remove [MAC]           unpair / remove a Bluetooth device (alias: unpair)
+#   kenzo-bt start                  load modules, unblock rfkill, and start bluetooth.service
+#   kenzo-bt diag                   diagnose kernel modules, sysfs hci, rfkill, and dmesg
+set -uo pipefail
+
+say() { printf '\n== %s\n' "$*"; }
+need_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || { echo "Run with sudo: sudo kenzo-bt $*" >&2; exit 1; }; }
+
+get_adapter() {
+	local h
+	h="$(ls /sys/class/bluetooth 2>/dev/null | head -1 || true)"
+	echo "$h"
+}
+
+cmd_status() {
+	say "Bluetooth Status"
+	local adapter; adapter="$(get_adapter)"
+	if [[ -z "$adapter" ]]; then
+		echo "  Adapter: NONE DETECTED (/sys/class/bluetooth is empty)"
+		echo "  Tip: Run 'sudo kenzo-bt start' or 'sudo kenzo-wifi start' to initialize WCNSS."
+	else
+		echo "  Adapter: $adapter"
+		if command -v bluetoothctl >/dev/null 2>&1; then
+			local show; show="$(timeout 3 bluetoothctl show 2>/dev/null || true)"
+			if [[ -n "$show" ]]; then
+				local name mac powered pairable discoverable
+				mac="$(grep -E '^[[:space:]]*Controller' <<<"$show" | awk '{print $2}' | head -1)"
+				name="$(grep -E '^[[:space:]]*Name:' <<<"$show" | sed 's/^[[:space:]]*Name:[[:space:]]*//' | head -1)"
+				powered="$(grep -E '^[[:space:]]*Powered:' <<<"$show" | awk '{print $2}' | head -1)"
+				pairable="$(grep -E '^[[:space:]]*Pairable:' <<<"$show" | awk '{print $2}' | head -1)"
+				discoverable="$(grep -E '^[[:space:]]*Discoverable:' <<<"$show" | awk '{print $2}' | head -1)"
+				echo "  Address: ${mac:-unknown}"
+				echo "  Name:    ${name:-unknown}"
+				echo "  Power:   ${powered:-unknown}"
+				echo "  Pairable: ${pairable:-unknown} | Discoverable: ${discoverable:-unknown}"
+			fi
+		fi
+	fi
+
+	echo ""
+	echo "  rfkill state:"
+	if command -v rfkill >/dev/null 2>&1; then
+		rfkill list bluetooth 2>/dev/null | sed 's/^/    /' || echo "    no rfkill record"
+	else
+		echo "    (rfkill binary not installed)"
+	fi
+
+	echo ""
+	cmd_devices
+}
+
+cmd_on() {
+	need_root
+	say "Powering ON Bluetooth..."
+	rfkill unblock bluetooth 2>/dev/null || true
+	systemctl start bluetooth 2>/dev/null || true
+	sleep 1
+	if command -v bluetoothctl >/dev/null 2>&1; then
+		bluetoothctl power on >/dev/null 2>&1 || true
+	fi
+	local adapter; adapter="$(get_adapter)"
+	if [[ -n "$adapter" ]]; then
+		echo "Bluetooth powered ON ($adapter)."
+	else
+		echo "Warning: rfkill unblocked, but no hci controller found in /sys/class/bluetooth."
+		echo "Run 'sudo kenzo-bt start' to load kernel drivers."
+	fi
+}
+
+cmd_off() {
+	need_root
+	say "Powering OFF Bluetooth..."
+	if command -v bluetoothctl >/dev/null 2>&1; then
+		bluetoothctl power off >/dev/null 2>&1 || true
+	fi
+	rfkill block bluetooth 2>/dev/null || true
+	echo "Bluetooth powered OFF."
+}
+
+cmd_scan() {
+	local sec="${1:-10}"
+	local adapter; adapter="$(get_adapter)"
+	if [[ -z "$adapter" ]]; then
+		echo "No Bluetooth adapter found. Run 'sudo kenzo-bt start' first." >&2
+		exit 1
+	fi
+
+	# Ensure powered on
+	if command -v bluetoothctl >/dev/null 2>&1; then
+		timeout 3 bluetoothctl power on >/dev/null 2>&1 || true
+	fi
+
+	say "Scanning for Bluetooth devices for ${sec}s (ensure your device is in pairing mode)..."
+	if command -v bluetoothctl >/dev/null 2>&1; then
+		# Run scan using bluetoothctl
+		timeout "$sec" bluetoothctl --timeout "$sec" scan on 2>/dev/null || true
+		echo ""
+		say "Discovered Devices:"
+		local devs
+		devs="$(bluetoothctl devices 2>/dev/null || true)"
+		if [[ -n "$devs" ]]; then
+			echo "$devs" | sed 's/^Device /  /'
+			echo ""
+			echo "To pair: sudo kenzo-bt pair <MAC>"
+		else
+			echo "  No devices found. Try moving closer or re-enabling pairing mode."
+		fi
+	else
+		echo "ERROR: bluetoothctl not installed (apt install bluez)." >&2
+		exit 1
+	fi
+}
+
+cmd_devices() {
+	echo "  Known & Connected Devices:"
+	if ! command -v bluetoothctl >/dev/null 2>&1; then
+		echo "    (bluetoothctl not installed)"
+		return 0
+	fi
+
+	local connected paired all
+	connected="$(timeout 3 bluetoothctl devices Connected 2>/dev/null || true)"
+	paired="$(timeout 3 bluetoothctl devices Paired 2>/dev/null || true)"
+	all="$(timeout 3 bluetoothctl devices 2>/dev/null || true)"
+
+	if [[ -z "$all" && -z "$paired" ]]; then
+		echo "    (no paired or known devices. Run 'sudo kenzo-bt scan' to discover)"
+		return 0
+	fi
+
+	# Print devices with status
+	local line mac name
+	while IFS= read -r line; do
+		[[ -n "$line" ]] || continue
+		mac="$(awk '{print $2}' <<<"$line")"
+		name="$(cut -d' ' -f3- <<<"$line")"
+		if grep -qF "$mac" <<<"$connected"; then
+			printf '    [CONNECTED] %-18s %s\n' "$mac" "$name"
+		elif grep -qF "$mac" <<<"$paired"; then
+			printf '    [ PAIRED  ] %-18s %s\n' "$mac" "$name"
+		else
+			printf '    [ KNOWN   ] %-18s %s\n' "$mac" "$name"
+		fi
+	done <<<"${all:-$paired}"
+}
+
+cmd_pair() {
+	need_root
+	local mac="${1:-}"
+	if [[ -z "$mac" ]]; then
+		say "Discovered / Known Devices:"
+		cmd_devices
+		echo ""
+		read -rp "Enter device MAC address to pair (e.g. AA:BB:CC:DD:EE:FF): " mac
+		[[ -n "$mac" ]] || { echo "No MAC entered."; return 0; }
+	fi
+
+	# Standardize MAC format
+	mac="$(tr '[:lower:]' '[:upper:]' <<<"$mac")"
+	if ! grep -qE '^([0-9A-F]{2}:){5}[0-9A-F]{2}$' <<<"$mac"; then
+		echo "ERROR: Invalid MAC format: '$mac'. Expected format: AA:BB:CC:DD:EE:FF" >&2
+		exit 1
+	fi
+
+	say "Pairing with $mac..."
+	bluetoothctl agent on >/dev/null 2>&1 || true
+	bluetoothctl default-agent >/dev/null 2>&1 || true
+
+	echo "==> Sending pair request..."
+	if bluetoothctl pair "$mac"; then
+		echo "==> Trusting device..."
+		bluetoothctl trust "$mac" >/dev/null 2>&1 || true
+		echo "==> Connecting..."
+		bluetoothctl connect "$mac" || true
+		say "Pairing complete!"
+		echo "Device $mac is paired and trusted."
+	else
+		echo "ERROR: Failed to pair with $mac."
+		echo "Tips:"
+		echo "  - Ensure the target device is in pairing / discovery mode."
+		echo "  - If it requires a PIN, run 'bluetoothctl' interactively."
+	fi
+}
+
+cmd_connect() {
+	need_root
+	local mac="${1:-}"
+	if [[ -z "$mac" ]]; then
+		cmd_devices
+		echo ""
+		read -rp "Enter MAC address to connect: " mac
+		[[ -n "$mac" ]] || { echo "No MAC entered."; return 0; }
+	fi
+	mac="$(tr '[:lower:]' '[:upper:]' <<<"$mac")"
+	say "Connecting to $mac..."
+	if bluetoothctl connect "$mac"; then
+		echo "Connected to $mac successfully."
+	else
+		echo "Failed to connect to $mac. Verify device is powered on and in range."
+	fi
+}
+
+cmd_disconnect() {
+	need_root
+	local mac="${1:-}"
+	if [[ -z "$mac" ]]; then
+		local connected
+		connected="$(bluetoothctl devices Connected 2>/dev/null || true)"
+		if [[ -z "$connected" ]]; then
+			echo "No devices currently connected."
+			return 0
+		fi
+		echo "$connected" | sed 's/^Device /  /'
+		echo ""
+		read -rp "Enter MAC address to disconnect: " mac
+		[[ -n "$mac" ]] || { echo "No MAC entered."; return 0; }
+	fi
+	mac="$(tr '[:lower:]' '[:upper:]' <<<"$mac")"
+	say "Disconnecting from $mac..."
+	bluetoothctl disconnect "$mac"
+}
+
+cmd_remove() {
+	need_root
+	local mac="${1:-}"
+	if [[ -z "$mac" ]]; then
+		cmd_devices
+		echo ""
+		read -rp "Enter MAC address to unpair/remove: " mac
+		[[ -n "$mac" ]] || { echo "No MAC entered."; return 0; }
+	fi
+	mac="$(tr '[:lower:]' '[:upper:]' <<<"$mac")"
+	say "Removing device $mac..."
+	bluetoothctl remove "$mac"
+	echo "Device $mac removed."
+}
+
+cmd_start() {
+	need_root
+	say "Starting Bluetooth subsystem..."
+	for m in rfkill bluetooth btqca btqcomsmd hidp uhid; do
+		modprobe "$m" 2>/dev/null || true
+	done
+	rfkill unblock bluetooth 2>/dev/null || true
+	systemctl enable --now bluetooth 2>/dev/null || systemctl restart bluetooth 2>/dev/null || true
+	sleep 2
+
+	local adapter; adapter="$(get_adapter)"
+	if [[ -n "$adapter" ]]; then
+		bluetoothctl power on >/dev/null 2>&1 || true
+		echo "Bluetooth adapter ready: $adapter"
+		cmd_status
+	else
+		echo "Warning: Bluetooth modules loaded, but no hciX found in /sys/class/bluetooth."
+		echo "On MSM8956 (Kenzo), Bluetooth requires the WCNSS Pronto remoteproc firmware."
+		echo "Run: sudo kenzo-wifi firmware && sudo kenzo-wifi start"
+	fi
+}
+
+cmd_diag() {
+	say "Kernel & Modules"
+	uname -a
+	echo "modules dir: $(ls -d /lib/modules/"$(uname -r)" 2>/dev/null || echo 'MISSING')"
+	echo ""
+	echo "Bluetooth & Input Kernel Modules:"
+	local m has_fname is_loaded
+	for m in rfkill bluetooth btqca btqcomsmd hidp uhid; do
+		has_fname="no"; modinfo -n "$m" >/dev/null 2>&1 && has_fname="yes"
+		is_loaded="$(lsmod | awk -v mod="$m" '$1==mod{f=1} END{print f?"yes":"no"}')"
+		printf '  %-16s file=%-6s loaded=%s\n' "$m" "$has_fname" "$is_loaded"
+	done
+
+	say "WCNSS Remoteproc (Hardware Host for Wi-Fi & BT)"
+	local r any=0
+	for r in /sys/class/remoteproc/remoteproc*; do
+		[[ -e "$r" ]] || continue
+		any=1
+		echo "  $(basename "$r"): name=$(cat "$r/name" 2>/dev/null) state=$(cat "$r/state" 2>/dev/null) fw=$(cat "$r/firmware" 2>/dev/null)"
+	done
+	[[ $any -eq 1 ]] || echo "  No remoteproc found."
+
+	say "Bluetooth Controllers (/sys/class/bluetooth)"
+	local devs; devs="$(ls /sys/class/bluetooth 2>/dev/null || true)"
+	if [[ -n "$devs" ]]; then
+		for d in $devs; do
+			echo "  $d -> address=$(cat "/sys/class/bluetooth/$d/address" 2>/dev/null || echo '?') type=$(cat "/sys/class/bluetooth/$d/type" 2>/dev/null || echo '?')"
+		done
+	else
+		echo "  NONE (no hciX controller present in sysfs)"
+	fi
+
+	say "rfkill state"
+	rfkill list 2>/dev/null || echo "  (rfkill not available)"
+
+	say "systemd service (bluetooth.service)"
+	systemctl status bluetooth --no-pager 2>/dev/null | head -15 || echo "  systemctl status unavailable"
+
+	say "Recent dmesg (Bluetooth / HCI / SMD)"
+	dmesg 2>/dev/null | grep -iE 'bluetooth|hci|btqcomsmd|wcnss|pronto' | tail -30 || true
+}
+
+case "${1:-}" in
+	status)      cmd_status ;;
+	on)          cmd_on ;;
+	off)         cmd_off ;;
+	scan)        shift; cmd_scan "$@" ;;
+	devices)     cmd_devices ;;
+	pair)        shift; cmd_pair "$@" ;;
+	connect)     shift; cmd_connect "$@" ;;
+	disconnect)  shift; cmd_disconnect "$@" ;;
+	remove|unpair) shift; cmd_remove "$@" ;;
+	start)       cmd_start ;;
+	diag)        cmd_diag ;;
+	*)
+		sed -n 2,13p "$0"
+		exit 1
+		;;
+esac

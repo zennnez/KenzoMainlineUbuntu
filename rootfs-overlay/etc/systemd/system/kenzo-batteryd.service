@@ -1,0 +1,12 @@
+[Unit]
+Description=Kenzo Battery Charge Limit & USB Pass-Through Daemon
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/kenzo-batteryd run
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

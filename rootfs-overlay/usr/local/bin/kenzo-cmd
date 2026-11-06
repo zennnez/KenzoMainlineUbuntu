@@ -1,0 +1,279 @@
+#!/usr/bin/env bash
+# kenzo-cmd - run things on the phone's OWN screen and shell, not in your SSH/host terminal.
+#
+# The phone's screen (tty1) runs a tmux session called "kenzo". kenzo-cmd drives that session, so what
+# you start here appears on the display and is usable with the phone's keyboard/touch/Bluetooth keys.
+#
+#   kenzo-cmd COMMAND [ARGS...]     run it on the phone's screen (a new window; shorthand for "run")
+#   kenzo-cmd "ls -la | less"       one quoted argument is run as a shell command line
+#   kenzo-cmd run [OPTIONS] [--] COMMAND...
+#        -w, --wait                 wait for it to end; exit status = the command's status
+#        -c, --capture              also send its output back to this terminal (implies --wait;
+#                                   the command then sees a pipe instead of a terminal)
+#        -k, --keep                 keep the window open after it ends (press Enter to close)
+#        -n, --name NAME            window name
+#            --cwd DIR              start in DIR (default: the current directory)
+#            --no-focus             do not switch the display to the new window
+#            --no-wake              do not try to switch the screen on
+#   kenzo-cmd type [--enter] TEXT   type TEXT into whatever is focused on the display
+#   kenzo-cmd key KEY...            send keys to the display (Enter, C-c, Escape, Up, ...)
+#   kenzo-cmd screen                print what the display shows right now
+#   kenzo-cmd shell [-r]            attach this terminal to the phone's session (-r read-only; Ctrl-b d leaves)
+#   kenzo-cmd ls                    list the windows on the phone
+#   kenzo-cmd kill [NAME|ID]        close a window (default: the one opened last)
+#   kenzo-cmd status                session, display and screen state
+#   kenzo-cmd banner [--wait SEC]   redraw the fastfetch banner on the display (used at boot)
+#   kenzo-cmd btop                  run or toggle btop monitor on the phone display
+#
+# Run it as the phone's login user (the one on tty1), or as root. To stop tty1 using tmux: touch ~/.kenzo-no-tmux
+set -u
+
+SESSION=${KENZO_CMD_SESSION:-kenzo}
+STATE_FILE=/run/kenzo-screen.state
+
+die()  { echo "kenzo-cmd: $*" >&2; exit "${2:-1}"; }
+warn() { echo "kenzo-cmd: $*" >&2; }
+
+command -v tmux >/dev/null 2>&1 || die "tmux is not installed (apt install tmux)"
+
+first_user() { getent passwd | awk -F: '$3 >= 1000 && $3 < 60000 && $7 !~ /(nologin|false)$/ { print $1; exit }'; }
+KUSER=${KENZO_CMD_USER:-$(first_user)}
+KUSER=${KUSER:-kenzo}
+KUID=$(id -u "$KUSER" 2>/dev/null) || die "user '$KUSER' does not exist (set KENZO_CMD_USER)"
+
+tm() {   # tmux as the phone's login user
+  if [[ $(id -u) == "$KUID" ]]; then tmux "$@"
+  elif [[ $(id -u) == 0 ]]; then runuser -u "$KUSER" -- tmux "$@"
+  else die "run this as '$KUSER' (the phone's login user) or as root"
+  fi
+}
+
+JOBDIR=/tmp/kenzo-cmd-$KUID
+if [[ -d $JOBDIR ]]; then
+  [[ $(stat -c %u "$JOBDIR") == "$KUID" ]] || die "$JOBDIR is not owned by $KUSER; refusing to use it"
+else
+  mkdir -m 700 "$JOBDIR" || die "cannot create $JOBDIR"
+  [[ $(id -u) == 0 ]] && chown "$KUID" "$JOBDIR"
+fi
+chown_job() { [[ $(id -u) == 0 ]] && chown "$KUID" "$@" 2>/dev/null; return 0; }
+
+ensure_session() {
+  tm has-session -t "=$SESSION" 2>/dev/null && return 0
+  tm new-session -d -s "$SESSION" -x 120 -y 40 || die "could not start the tmux session '$SESSION'"
+}
+
+on_display() {   # 0 when a tmux client of the session is attached to the phone's screen (tty1)
+  tm list-clients -t "=$SESSION" -F '#{client_tty}' 2>/dev/null | grep -qx '/dev/tty1'
+}
+
+wake_display() {  # best effort: screen on, tty1 in front
+  local st act
+  st=$(cat "$STATE_FILE" 2>/dev/null)
+  if [[ $st == off ]]; then
+    if [[ $(id -u) == 0 ]]; then kenzo-screen on >/dev/null 2>&1 || warn "could not switch the screen on"
+    else sudo -n kenzo-screen on >/dev/null 2>&1 || warn "the screen is off and could not be switched on without sudo rights (kenzo-screen on)"; fi
+  fi
+  act=$(cat /sys/class/tty/tty0/active 2>/dev/null)
+  if [[ -n $act && $act != tty1 ]]; then
+    if [[ $(id -u) == 0 ]]; then chvt 1 2>/dev/null; else sudo -n chvt 1 2>/dev/null; fi
+  fi
+  return 0
+}
+
+focused_is_shell() {
+  local c; c=$(tm display-message -p -t "=$SESSION:" '#{pane_current_command}' 2>/dev/null)
+  case $c in zsh|bash|sh|dash|fish|-zsh|-bash) return 0 ;; *) return 1 ;; esac
+}
+
+# ---------------------------------------------------------------- run
+cmd_run() {
+  local wait=0 capture=0 keep=0 focus=1 wake=1 name="" cwd=$PWD cmd id job winid rc tailpid=""
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      -w|--wait) wait=1 ;;
+      -c|--capture) capture=1; wait=1 ;;
+      -k|--keep) keep=1 ;;
+      -n|--name) [[ $# -ge 2 ]] || die "$1 needs a value"; name=$2; shift ;;
+      --cwd) [[ $# -ge 2 ]] || die "--cwd needs a value"; cwd=$2; shift ;;
+      --no-focus) focus=0 ;;
+      --no-wake) wake=0 ;;
+      --) shift; break ;;
+      -*) die "unknown option $1 (see: kenzo-cmd help)" ;;
+      *) break ;;
+    esac
+    shift
+  done
+  [[ $# -gt 0 ]] || die "nothing to run"
+  if [[ $# -eq 1 ]]; then cmd=$1; else cmd=$(printf '%q ' "$@"); fi
+  [[ -d $cwd ]] || die "no such directory: $cwd"
+
+  find "$JOBDIR" -type f -mtime +1 -delete 2>/dev/null      # leftovers of windows that were killed long ago
+  ensure_session
+  (( wake )) && wake_display
+  on_display || warn "nothing is attached to the phone's screen (tty1 not logged in?): the command still runs, but you will not see it there"
+
+  id="$(date +%s)-$$-$RANDOM"
+  job="$JOBDIR/$id"
+  printf '%s\n' "$cmd" > "$job.cmd"
+  : > "$job.out"
+  {
+    echo '#!/bin/bash'
+    echo 'trap : INT          # Ctrl-C stops the command, not this wrapper (so it can still report and clean up)'
+    printf 'cd %q 2>/dev/null || cd "$HOME"\n' "$cwd"
+    if (( capture )); then
+      printf 'bash %q 2>&1 | tee %q\nrc=${PIPESTATUS[0]}\n' "$job.cmd" "$job.out"
+    else
+      printf 'bash %q\nrc=$?\n' "$job.cmd"
+    fi
+    printf 'echo "$rc" > %q && mv %q %q\n' "$job.rc.tmp" "$job.rc.tmp" "$job.rc"
+    if (( keep )); then echo 'echo; echo "[kenzo-cmd] exit status $rc - press Enter to close"; read -r _'; fi
+    if (( ! wait )); then printf 'rm -f %q %q %q %q\n' "$job.cmd" "$job.out" "$job.rc" "$job.sh"; fi
+    echo 'exit "$rc"'
+  } > "$job.sh"
+  chown_job "$job.cmd" "$job.out" "$job.sh"
+
+  local flags=(-P -F '#{window_id}' -t "=$SESSION:")
+  (( focus )) || flags+=(-d)
+  [[ -n $name ]] && flags+=(-n "$name")
+  winid=$(tm new-window "${flags[@]}" "bash $(printf %q "$job.sh")") || { rm -f "$job".*; die "could not open a window in session '$SESSION'"; }
+  echo "$winid" > "$JOBDIR/last"; chown_job "$JOBDIR/last"
+  tm set-option -w -t "$winid" @kenzo_job "$id" 2>/dev/null       # lets "kill" find and remove this job's files
+
+  if (( ! wait )); then
+    echo "started on the phone (window $winid${name:+, $name})"
+    return 0
+  fi
+
+  if (( capture )); then tail -n +1 -F "$job.out" 2>/dev/null & tailpid=$!; fi
+  while [[ ! -e $job.rc ]]; do
+    if ! tm list-windows -t "=$SESSION" -F '#{window_id}' 2>/dev/null | grep -qx -- "$winid"; then
+      sleep 0.3
+      [[ -e $job.rc ]] && break
+      [[ -n $tailpid ]] && kill "$tailpid" 2>/dev/null
+      rm -f "$job".*
+      die "the window was closed before the command finished" 130
+    fi
+    sleep 0.2
+  done
+  if [[ -n $tailpid ]]; then sleep 0.4; kill "$tailpid" 2>/dev/null; wait "$tailpid" 2>/dev/null; fi
+  rc=$(cat "$job.rc" 2>/dev/null); rc=${rc:-1}
+  rm -f "$job".*
+  return "$rc"
+}
+
+# ---------------------------------------------------------------- the rest
+cmd_type() {
+  local enter=0 text
+  if [[ ${1:-} == --enter ]]; then enter=1; shift; fi
+  [[ $# -gt 0 ]] || die "usage: kenzo-cmd type [--enter] TEXT"
+  text="$*"
+  ensure_session
+  tm send-keys -t "=$SESSION:" -l -- "$text" || die "could not type into the session"
+  (( enter )) && tm send-keys -t "=$SESSION:" Enter
+  return 0
+}
+
+cmd_key() {
+  [[ $# -gt 0 ]] || die "usage: kenzo-cmd key KEY... (Enter, C-c, Escape, Up, Tab, ...)"
+  ensure_session
+  tm send-keys -t "=$SESSION:" "$@" || die "tmux did not accept those keys"
+}
+
+cmd_screen() {
+  tm has-session -t "=$SESSION" 2>/dev/null || die "no '$SESSION' session yet (nothing has been started on the phone)"
+  tm capture-pane -p -t "=$SESSION:" | sed -e :a -e '/^[[:space:]]*$/{$d;N;ba' -e '}'
+}
+
+cmd_shell() {
+  local ro=()
+  [[ ${1:-} == -r ]] && ro=(-r)
+  ensure_session
+  if [[ $(id -u) == "$KUID" ]]; then exec tmux attach-session "${ro[@]}" -f ignore-size -t "=$SESSION"
+  else exec runuser -u "$KUSER" -- tmux attach-session "${ro[@]}" -f ignore-size -t "=$SESSION"; fi
+}
+
+cmd_ls() {
+  tm has-session -t "=$SESSION" 2>/dev/null || { echo "no '$SESSION' session yet"; return 0; }
+  tm list-windows -t "=$SESSION" -F '#{window_index}  #{window_id}  #{window_name}  [#{pane_current_command}]#{?window_active,  <- focused,}'
+}
+
+cmd_kill() {
+  local target=${1:-}
+  tm has-session -t "=$SESSION" 2>/dev/null || die "no '$SESSION' session"
+  [[ -n $target ]] || target=$(cat "$JOBDIR/last" 2>/dev/null)
+  [[ -n $target ]] || die "nothing to close (give a window name or id; see: kenzo-cmd ls)"
+  local wid
+  if [[ $target == @* ]]; then wid=$target; else wid=$(tm display-message -p -t "=$SESSION:$target" '#{window_id}' 2>/dev/null); fi
+  [[ -n $wid ]] || die "no such window: $target"
+  local jid; jid=$(tm display-message -p -t "$wid" '#{@kenzo_job}' 2>/dev/null)
+  tm kill-window -t "$wid" 2>/dev/null || die "no such window: $target"
+  [[ $jid =~ ^[0-9]+-[0-9]+-[0-9]+$ ]] && rm -f "$JOBDIR/$jid".*
+  return 0
+}
+
+cmd_status() {
+  echo "user:      $KUSER"
+  if tm has-session -t "=$SESSION" 2>/dev/null; then
+    echo "session:   $SESSION ($(tm list-windows -t "=$SESSION" | wc -l) window(s))"
+    echo "clients:   $(tm list-clients -t "=$SESSION" -F '#{client_tty}' 2>/dev/null | tr '\n' ' ')"
+  else echo "session:   none yet"; fi
+  if on_display 2>/dev/null; then echo "display:   attached (tty1)"; else echo "display:   no client on tty1 (log in on the phone's screen)"; fi
+  echo "screen:    $(cat "$STATE_FILE" 2>/dev/null || echo unknown)   active VT: $(cat /sys/class/tty/tty0/active 2>/dev/null || echo ?)"
+}
+
+cmd_banner() {   # redraw the fastfetch banner in the focused window, once the display session is up
+  local wait=0 i
+  if [[ ${1:-} == --wait ]]; then wait=${2:-20}; fi
+  for (( i = 0; i <= wait; i++ )); do
+    if tm has-session -t "=$SESSION" 2>/dev/null && on_display; then
+      if focused_is_shell; then tm send-keys -t "=$SESSION:" -l -- 'clear; fastfetch' && tm send-keys -t "=$SESSION:" Enter; return 0; fi
+      return 0                          # something else is in front; leave it alone
+    fi
+    (( i < wait )) && sleep 1
+  done
+  return 1
+}
+
+cmd_btop() {
+  ensure_session
+  wake_display
+
+  local cur_win_name cur_cmd
+  cur_win_name=$(tm display-message -p -t "=$SESSION:" '#{window_name}' 2>/dev/null || true)
+  cur_cmd=$(tm display-message -p -t "=$SESSION:" '#{pane_current_command}' 2>/dev/null || true)
+
+  if [[ "$cur_win_name" == "btop" || "$cur_cmd" == "btop" ]]; then
+    # Already focused on btop: toggle back to previous window
+    tm last-window -t "=$SESSION" 2>/dev/null || true
+    return 0
+  fi
+
+  # Check if a btop window already exists in the session
+  local btop_wid
+  btop_wid=$(tm list-windows -t "=$SESSION" -F '#{window_id}:#{window_name}:#{pane_current_command}' 2>/dev/null \
+    | awk -F: '$2 == "btop" || $3 == "btop" { print $1; exit }')
+
+  if [[ -n "$btop_wid" ]]; then
+    tm select-window -t "$btop_wid" 2>/dev/null || true
+  else
+    tm new-window -t "=$SESSION:" -n btop "env LANG=C.UTF-8 LC_ALL=C.UTF-8 btop --force-utf" || die "could not start btop"
+  fi
+}
+
+usage() { sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; }
+
+case ${1:-} in
+  "") usage; exit 2 ;;
+  -h|--help|help) usage ;;
+  run)    shift; cmd_run "$@" ;;
+  btop)   shift; cmd_btop "$@" ;;
+  type)   shift; cmd_type "$@" ;;
+  key)    shift; cmd_key "$@" ;;
+  screen) cmd_screen ;;
+  shell)  shift; cmd_shell "$@" ;;
+  ls)     cmd_ls ;;
+  kill)   shift; cmd_kill "$@" ;;
+  status) cmd_status ;;
+  banner) shift; cmd_banner "$@" ;;
+  *)      cmd_run "$@" ;;      # anything else is the command itself (also leading run options like -w)
+esac

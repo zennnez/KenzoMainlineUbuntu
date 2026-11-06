@@ -1,0 +1,33 @@
+# ============================================================
+# caddy_oracle -- Caddyfile for the Oracle relay
+#
+# Installed to /etc/caddy/Caddyfile by setup_oracle.sh
+#
+#   Internet -> Oracle: public TLS (Let's Encrypt) terminates here
+#            -> 127.0.0.1:8080 = the phone's SSH reverse tunnel
+#            -> the phone's own Caddy, which routes by hostname
+# ============================================================
+{
+	email admin@example.com
+}
+
+# Shared by every domain below.
+(relay) {
+	reverse_proxy 127.0.0.1:8080 {
+		# ride out short tunnel reconnects instead of returning 502
+		lb_try_duration 10s
+		lb_try_interval 250ms
+		header_up X-Real-IP {remote_host}
+	}
+}
+
+# ==================== ACTIVE DOMAINS ====================
+app.example.com {
+	import relay
+}
+
+# ==================== CATCH-ALL ====================
+# Plain HTTP requests not matching active domains
+:80 {
+	respond "Access denied" 403
+}

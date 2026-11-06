@@ -1,0 +1,12 @@
+[Unit]
+Description=Kenzo Wi-Fi regulatory country (needed for 5 GHz channels)
+Before=NetworkManager.service
+After=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+# "-": a missing driver/regdb must never fail the boot
+ExecStart=-/usr/local/sbin/kenzo-wifi-band regdom
+
+[Install]
+WantedBy=multi-user.target

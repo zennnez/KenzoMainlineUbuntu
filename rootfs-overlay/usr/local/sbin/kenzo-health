@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# kenzo-health: read-only check of everything that SHOULD be running on the phone.
+#   sudo kenzo-health           (root is needed for the full dmesg / deferred-probe list)
+# Prints OK / WARN / FAIL per item; exit status 1 if any FAIL. Never changes anything, never prompts.
+set -uo pipefail
+
+FWDIR="${FWDIR:-/usr/lib/firmware}"
+SYS="${SYS:-/sys}"
+nfail=0; nwarn=0
+say()  { printf '\n== %s\n' "$*"; }
+ok()   { printf '  OK    %s\n' "$*"; }
+warn() { printf '  WARN  %s\n' "$*"; nwarn=$((nwarn+1)); }
+fail() { printf '  FAIL  %s\n' "$*"; nfail=$((nfail+1)); }
+have() { command -v "$1" >/dev/null 2>&1; }
+[[ ${EUID:-$(id -u)} -eq 0 ]] || echo "note: not root, dmesg/debugfs checks may be incomplete (use sudo)"
+
+say "systemd: failed units"
+if have systemctl; then
+	failed="$(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}')"
+	if [[ -n "$failed" ]]; then while read -r u; do fail "$u is failed  (journalctl -u $u -b)"; done <<<"$failed"; else ok "none"; fi
+else
+	warn "systemctl not found"
+fi
+
+say "systemd: services that should be active"
+# unit|severity if inactive
+for spec in ssh.service:FAIL usb-gadget-rndis.service:FAIL systemd-modules-load.service:FAIL \
+            NetworkManager.service:FAIL bluetooth.service:WARN avahi-daemon.service:WARN \
+            systemd-timesyncd.service:WARN docker.service:WARN containerd.service:WARN \
+            kenzo-powerkey.service:WARN kenzo-zram.service:WARN kenzo-screen-banner.service:WARN \
+            kenzo-batteryd.service:WARN getty@tty1.service:WARN; do
+	u="${spec%%:*}"; sev="${spec##*:}"
+	st="$(systemctl is-active "$u" 2>/dev/null)"; en="$(systemctl is-enabled "$u" 2>/dev/null)"
+	if [[ "$st" == active ]]; then ok "$u active ($en)"
+	elif [[ "$en" == "" || "$en" == "not-found" ]]; then warn "$u not installed"
+	elif [[ $sev == FAIL ]]; then fail "$u is $st (enabled: $en)"
+	else warn "$u is $st (enabled: $en)"; fi
+done
+for u in ufw.service fail2ban.service; do
+	systemctl cat "$u" >/dev/null 2>&1 || continue
+	[[ "$(systemctl is-active "$u" 2>/dev/null)" == active ]] && ok "$u active" || echo "  info  $u installed but not active (enable it via setup_kenzo.sh when you want it)"
+done
+
+say "remoteprocs (modem/adsp/wcnss firmware cores)"
+any=0
+for r in "$SYS"/class/remoteproc/remoteproc*; do
+	[[ -e $r ]] || continue; any=1
+	n="$(cat "$r/name" 2>/dev/null)"; st="$(cat "$r/state" 2>/dev/null)"; fw="$(cat "$r/firmware" 2>/dev/null)"
+	have_fw="no"; [[ -e "$FWDIR/$fw" ]] && have_fw="yes"
+	case "$st" in
+		running) ok "$(basename "$r") $n running (fw $fw)" ;;
+		*)       fail "$(basename "$r") $n is '$st' (fw $fw present=$have_fw)"
+		         dmesg 2>/dev/null | tr -d '\0' | grep -E "$(basename "$r")[: ]|$n" | tail -8 | sed 's/^/        dmesg: /'
+		         if [[ $st == crashed ]] && dmesg 2>/dev/null | grep -q "crash detected in $n: type watchdog"; then
+		         	echo "        hint: repeated 'type watchdog' crashes right after boot = wrong wdog IRQ in the DTS (patches/kernel/0001) -> rebuild kernel + boot.img."
+		         	echo "        stop the loop now:  echo disabled | sudo tee $r/recovery"
+		         fi ;;
+	esac
+done
+[[ $any -eq 1 ]] || fail "no remoteproc devices (qcom_wcnss_pil / qcom_q6v5_pas not loaded or no DT nodes)"
+
+say "firmware / probe problems since boot (dmesg)"
+dm="$(dmesg 2>/dev/null | tr -d '\0')"
+if [[ -z "$dm" ]]; then
+	warn "cannot read dmesg (run with sudo)"
+else
+	fwf="$(grep -E 'Direct firmware load for .* failed with error' <<<"$dm" | sed -E 's/^\[[ 0-9.]+\] //' | sort -u)"
+	# a later success makes an early failure harmless: only report firmware that is STILL missing on disk
+	if [[ -n "$fwf" ]]; then
+		while read -r line; do
+			f="$(sed -nE 's/.*Direct firmware load for ([^ ]+) failed.*/\1/p' <<<"$line")"
+			if [[ -n "$f" && -e "$FWDIR/$f" ]]; then
+				echo "  info  $f failed at boot but exists now (loaded later / retry on next boot): $f"
+			else
+				warn "firmware missing: $f   <- $line"
+			fi
+		done <<<"$fwf"
+	else
+		ok "no firmware load failures"
+	fi
+	pf="$(grep -iE 'probe of .* failed with error|probe with driver .* failed' <<<"$dm" | sed -E 's/^\[[ 0-9.]+\] //' | sort -u | head -20)"
+	[[ -n "$pf" ]] && { while read -r l; do warn "$l"; done <<<"$pf"; } || ok "no driver probe failures"
+fi
+if [[ -r "$SYS/kernel/debug/devices_deferred" ]]; then
+	d="$(cat "$SYS/kernel/debug/devices_deferred" 2>/dev/null)"
+	[[ -n "$d" ]] && { echo "$d" | while read -r l; do [[ -n $l ]] && warn "deferred probe still pending: $l"; done; } || ok "no deferred probes"
+else
+	echo "  info  debugfs not readable (sudo mount -t debugfs none /sys/kernel/debug to list deferred probes)"
+fi
+
+say "modules from /etc/modules-load.d/kenzo-*.conf"
+mods="$(cat /etc/modules-load.d/kenzo-*.conf 2>/dev/null | sed 's/#.*//' | tr -s ' \t\n' '\n' | grep -v '^$' | sort -u)"
+if [[ -z "$mods" ]]; then warn "no kenzo modules-load list found"; else
+	kv="$(uname -r)"; builtin="/lib/modules/$kv/modules.builtin"
+	for m in $mods; do
+		mm="${m//-/_}"
+		if [[ -d "$SYS/module/$mm" ]] || lsmod 2>/dev/null | awk -v m="$mm" '$1==m{f=1} END{exit !f}'; then
+			ok "$m loaded/builtin"
+		elif [[ -r "$builtin" ]] && grep -qE "/${m}\.ko|/${mm}\.ko" "$builtin"; then
+			ok "$m built into the kernel"
+		elif modinfo -n "$m" >/dev/null 2>&1; then
+			fail "$m not loaded  (sudo modprobe $m; dmesg | tail)"
+		else
+			warn "$m is listed in modules-load.d but no such module exists in $kv (stale entry, harmless; remove it from /etc/modules-load.d)"
+		fi
+	done
+fi
+
+say "network / radios"
+ip -br link show wlan0 >/dev/null 2>&1 && ok "wlan0 present" || fail "wlan0 missing (run: sudo kenzo-wifi diag)"
+if ip -4 -br addr show dev wlan0 2>/dev/null | awk '{print $3}' | grep -q .; then
+	ok "wlan0 has IPv4 ($(ip -4 -br addr show dev wlan0 | awk '{print $3}'))"
+else warn "wlan0 has no IPv4 (not connected)"; fi
+if have iw && ip -br link show wlan0 >/dev/null 2>&1; then
+	pws="$(iw dev wlan0 get power_save 2>/dev/null | awk '{print $NF}')"
+	case "$pws" in
+		off) ok "wlan0 power save is off" ;;
+		on)  warn "wlan0 power save is ON (sudo iw dev wlan0 set power_save off; NetworkManager: sudo NetworkManager --print-config | grep -i -B1 -A1 powersave)" ;;
+		*)   echo "  info  wlan0 power save: unknown" ;;
+	esac
+	link="$(iw dev wlan0 link 2>/dev/null)"
+	if grep -q '^Connected' <<<"$link"; then
+		sig="$(sed -n 's/^[[:space:]]*signal: \(-\{0,1\}[0-9]\{1,\}\).*/\1/p' <<<"$link" | head -1)"
+		echo "  info  wlan0 link: SSID=$(sed -n 's/^[[:space:]]*SSID: //p' <<<"$link" | head -1) freq=$(sed -n 's/^[[:space:]]*freq: //p' <<<"$link" | head -1) signal=${sig:-?} dBm"
+		[[ "$sig" =~ ^-?[0-9]+$ && $sig -le -75 ]] && warn "weak Wi-Fi signal ($sig dBm): expect beacon loss and SSH drops"
+	else
+		warn "wlan0 is not associated"
+	fi
+fi
+if have journalctl; then
+	wl="$(journalctl -b -q -t wpa_supplicant --no-pager 2>/dev/null)"
+	bl="$(grep -c 'CTRL-EVENT-BEACON-LOSS' <<<"$wl")"; dc="$(grep -c 'CTRL-EVENT-DISCONNECTED' <<<"$wl")"
+	txb="$(dmesg 2>/dev/null | grep -c 'Bad TX complete indication')"
+	if [[ "$bl" -gt 0 || "$dc" -gt 0 ]]; then
+		warn "since boot: $bl beacon-loss, $dc disconnect events (last: $(grep -E 'BEACON-LOSS|DISCONNECTED' <<<"$wl" | tail -1 | cut -c1-15))"
+	else
+		ok "no beacon-loss/disconnect events since boot"
+	fi
+	[[ "$txb" -gt 0 ]] && echo "  info  wcn36xx 'Bad TX complete indication' x$txb since boot (firmware TX path glitches)"
+fi
+ip -br link show usb0 >/dev/null 2>&1 && ok "usb0 (RNDIS gadget) present" || warn "usb0 missing"
+[ -d "$SYS/class/bluetooth/hci0" ] && ok "hci0 present" || fail "no Bluetooth adapter (hci0)"
+if have rfkill; then
+	b="$(rfkill list 2>/dev/null | grep -B2 -E 'Soft blocked: yes|Hard blocked: yes' | grep -E '^[0-9]+:' )"
+	[[ -n "$b" ]] && warn "rfkill blocked: $b  (sudo rfkill unblock all)" || ok "rfkill: nothing blocked"
+fi
+
+say "memory / storage / time"
+if swapon --show --noheadings 2>/dev/null | grep -q zram; then ok "zram swap: $(swapon --show --noheadings | awk '/zram/{print $3" total"}' | head -1)"; else warn "no zram swap (sudo systemctl enable --now kenzo-zram)"; fi
+root_use="$(df -h --output=pcent,size / 2>/dev/null | tail -1 | tr -s ' ')"
+echo "  info  root fs usage/size:$root_use"
+if have timedatectl; then
+	[[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" == yes ]] && ok "clock NTP-synchronised" || warn "clock not NTP-synchronised yet (needs internet)"
+fi
+
+say "power / cpu"
+for ps in "$SYS"/class/power_supply/*; do
+	[[ -e $ps ]] || continue
+	[[ "$(cat "$ps/type" 2>/dev/null)" == Battery ]] || { echo "  info  $(basename "$ps"): status=$(cat "$ps/status" 2>/dev/null)"; continue; }
+	cap="$(cat "$ps/capacity" 2>/dev/null)"; stt="$(cat "$ps/status" 2>/dev/null)"
+	echo "  info  $(basename "$ps"): status=$stt capacity=${cap}% voltage_now=$(cat "$ps/voltage_now" 2>/dev/null) current_now=$(cat "$ps/current_now" 2>/dev/null) temp=$(cat "$ps/temp" 2>/dev/null)"
+	[[ "$cap" =~ ^[0-9]+$ && $cap -le 5 ]] && warn "battery at ${cap}% ($stt): charger may not keep up with the load, or the fuel gauge is not calibrated"
+done
+cpu_on="$(cat "$SYS/devices/system/cpu/online" 2>/dev/null)"; cpu_poss="$(cat "$SYS/devices/system/cpu/possible" 2>/dev/null)"
+echo "  info  cpus online: $cpu_on (possible: $cpu_poss)"
+# kenzo = MSM8956 = 4x A53 + 2x A72 = 6 CPUs. If the DT describes more, the extra ones fail to come online at every boot.
+if [[ -n $cpu_on && -n $cpu_poss && $cpu_on != "$cpu_poss" ]]; then
+	warn "some CPUs are possible but not online ($cpu_on of $cpu_poss): MSM8956 has only 6 cores; apply patches/kernel/0002 (build-kernel.sh does it) or check: dmesg | grep -i 'failed to come online'"
+fi
+
+say "summary"
+echo "  $nfail FAIL, $nwarn WARN"
+[[ $nfail -eq 0 ]]

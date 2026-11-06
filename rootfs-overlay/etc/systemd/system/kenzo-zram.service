@@ -1,0 +1,12 @@
+[Unit]
+Description=Kenzo ZRAM compressed swap (zstd)
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'swapon --show | grep -q zram0 || (zramctl /dev/zram0 --size 2G --algorithm zstd && mkswap /dev/zram0 && swapon -p 100 /dev/zram0)'
+ExecStop=/bin/sh -c 'swapoff /dev/zram0 2>/dev/null; zramctl --reset /dev/zram0 2>/dev/null || true'
+
+[Install]
+WantedBy=multi-user.target

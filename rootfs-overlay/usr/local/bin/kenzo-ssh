@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# kenzo-ssh - connection details for the Kenzo phone. They are part of the fastfetch report
+# (/etc/fastfetch/config.jsonc), which calls this helper once per line.
+#
+#   kenzo-ssh                 the full fastfetch report, connection details included
+#   kenzo-ssh --field NAME    one value: wifi | ssh-wifi | ssh-usb | ssh-name | ssh-tailscale | bluetooth
+set -u
+
+WIFI_IF=${KENZO_WIFI_IF:-wlan0}
+USB_IF=${KENZO_USB_IF:-usb0}
+
+login_user() {
+  local u=${KENZO_SSH_USER:-${SUDO_USER:-}}
+  [[ -z $u && $(id -u) != 0 ]] && u=$(id -un)
+  [[ -z $u || $u == root ]] && u=$(getent passwd | awk -F: '$3 >= 1000 && $3 < 60000 && $7 !~ /(nologin|false)$/ { print $1; exit }')
+  echo "${u:-kenzo}"
+}
+ip4() { ip -4 -br addr show dev "$1" 2>/dev/null | awk '{print $3}' | cut -d/ -f1 | head -1; }
+
+freq_to_chan() { local f=$1; if (( f == 2484 )); then echo 14; elif (( f < 3000 )); then echo $(( (f - 2407) / 5 )); else echo $(( (f - 5000) / 5 )); fi; }
+
+field() {
+  local u ip l ssid freq sig band
+  case $1 in
+    wifi)
+      ip=$(ip4 "$WIFI_IF")
+      if [[ -z $ip ]]; then echo "disconnected"; return; fi
+      if command -v iw >/dev/null 2>&1; then
+        l=$(iw dev "$WIFI_IF" link 2>/dev/null)
+        ssid=$(sed -n 's/^[[:space:]]*SSID: //p' <<<"$l" | head -1)
+        freq=$(sed -n 's/^[[:space:]]*freq: \([0-9]*\).*/\1/p' <<<"$l" | head -1)
+        sig=$(sed -n 's/^[[:space:]]*signal: //p' <<<"$l" | head -1)
+        if [[ -n $freq ]]; then
+          if (( freq >= 4900 )); then band="5 GHz"; else band="2.4 GHz"; fi
+          echo "${ssid:-?}  [$band ch$(freq_to_chan "$freq"), ${sig:-?}]"; return
+        fi
+        echo "${ssid:-connected}"; return
+      fi
+      echo "connected" ;;
+    ssh-wifi)      u=$(login_user); ip=$(ip4 "$WIFI_IF"); if [[ -n $ip ]]; then echo "ssh $u@$ip"; else echo "no Wi-Fi address"; fi ;;
+    ssh-usb)       u=$(login_user); ip=$(ip4 "$USB_IF");  if [[ -n $ip ]]; then echo "ssh $u@$ip"; else echo "cable disconnected / no address"; fi ;;
+    ssh-name)      u=$(login_user); echo "ssh $u@kenzo.local" ;;
+    ssh-tailscale)
+      u=$(login_user); ip=""
+      command -v tailscale >/dev/null 2>&1 && ip=$(timeout 2 tailscale ip -4 2>/dev/null | head -1)
+      [[ -z $ip ]] && ip=$(ip4 tailscale0)
+      if [[ -n $ip ]]; then echo "ssh $u@$ip"; else echo "not connected"; fi ;;
+    bluetooth)
+      if ! command -v bluetoothctl >/dev/null 2>&1 || [[ ! -d ${KENZO_BT_SYSFS:-/sys/class/bluetooth/hci0} ]]; then echo "no adapter"; return; fi
+      if ! timeout 2 bluetoothctl show 2>/dev/null | grep -q 'Powered: yes'; then echo "powered off"; return; fi
+      l=$(timeout 3 bluetoothctl devices Connected 2>/dev/null | sed -n 's/^Device [0-9A-Fa-f:]* //p' | paste -sd, - | sed 's/,/, /g')
+      if [[ -n $l ]]; then echo "$l"; else echo "on, nothing connected"; fi ;;
+    *) echo "unknown field '$1'" >&2; return 2 ;;
+  esac
+}
+
+case "${1:-}" in
+  --field) [[ $# -ge 2 ]] || { echo "usage: kenzo-ssh --field NAME" >&2; exit 2; }; field "$2" ;;
+  "")      exec fastfetch ;;
+  -h|--help) sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *)       echo "usage: kenzo-ssh [--field NAME]" >&2; exit 2 ;;
+esac

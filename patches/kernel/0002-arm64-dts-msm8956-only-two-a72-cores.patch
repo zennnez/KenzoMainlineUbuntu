@@ -1,0 +1,12 @@
+diff --git a/arch/arm64/boot/dts/qcom/msm8956.dtsi b/arch/arm64/boot/dts/qcom/msm8956.dtsi
+index 199f10054..bd44a6cf631f 100644
+--- a/arch/arm64/boot/dts/qcom/msm8956.dtsi
++++ b/arch/arm64/boot/dts/qcom/msm8956.dtsi
+@@ -24,6 +24,6 @@ &cpu6 {
+ 	status = "disabled";
+ };
+ 
+-&cpu7 {
++&cpu5 {
+ 	status = "disabled";
+ };

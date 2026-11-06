@@ -1,0 +1,512 @@
+#!/usr/bin/env bash
+# kenzo-wifi: diagnose / install firmware for / start the WCNSS Wi-Fi + Bluetooth block.
+#   kenzo-wifi diag                       what the kernel, device tree and firmware dir look like
+#   kenzo-wifi firmware [--modem DIR] [--nv FILE]
+#                                         copy wcnss.* and WCNSS_qcom_wlan_nv.bin into /usr/lib/firmware,
+#                                         found automatically on this phone's own modem/system partitions
+#                                         (mounted READ-ONLY), or given by hand
+#   kenzo-wifi start                      load modules, (re)start the wcnss remoteproc, show result
+#   kenzo-wifi connect [SSID] [PASS]      scan Wi-Fi networks, prompt/save to /etc/netplan/50-wifi-init.yaml
+# Needs no internet. Run with sudo.
+set -uo pipefail
+
+FWDIR="${FWDIR:-/usr/lib/firmware}"
+DT="${DT:-/proc/device-tree}"
+SYS="${SYS:-/sys}"
+LABELS_MODEM=(modem)
+LABELS_NV=(system vendor persist cache)
+TMPS=()
+cleanup() { local m; for m in "${TMPS[@]:-}"; do [[ -n "$m" ]] || continue; mountpoint -q "$m" && umount "$m" 2>/dev/null; rmdir "$m" 2>/dev/null; done; }
+trap cleanup EXIT
+
+say()  { printf '\n== %s\n' "$*"; }
+need_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || { echo "run with sudo" >&2; exit 1; }; }
+dtstr() { [[ -r $1 ]] || return 0; tr '\0' ' ' < "$1" 2>/dev/null | sed 's/ *$//'; }
+
+# Walk the device tree: print "<dir>|<compatible>|<status>|<firmware-name>" for wcnss-related nodes.
+# Heuristics, in order (any hit counts):
+#   1. node *name* (last path component) matches *wcnss* / *pronto* / *riva* / *iris*
+#   2. "compatible" property contains wcnss/pronto/wcn36/riva/iris (e.g. "qcom,wcnss", "qcom,wcnss-wlan")
+#   3. "firmware-name" property contains wcnss / WCNSS / .mdt / .mbn / pronto
+#   4. node lives under reserved-memory and its *name* / *reg* range is referenced by any wcnss-related DT symbol
+dt_nodes() {
+	local d f c fn name re
+	re='wcnss|pronto|wcn36|riva|iris|mdt|mbn'
+	local tmphits tmphits_nodup=()
+	tmphits="$({
+		# (1) compatible string matches
+		while IFS= read -r f; do
+			c="$(dtstr "$f")"
+			grep -qiE "$re" <<<"$c" || continue
+			d="$(dirname "$f")"; fn="$(dtstr "$d/firmware-name")"; printf '%s|%s|%s|%s\n' "${d#$DT}" "$c" "$(dtstr "$d/status")" "$fn"
+		done < <(find "$DT" -type f -name compatible 2>/dev/null)
+		# (2) firmware-name property matches, even if compatible is unrelated (MDT split loader nodes)
+		while IFS= read -r f; do
+			c="$(dtstr "$f")"
+			grep -qiE "$re" <<<"$c" || continue
+			d="$(dirname "$f")"
+			printf '%s|%s|%s|%s\n' "${d#$DT}" "$(dtstr "$d/compatible")" "$(dtstr "$d/status")" "$c"
+		done < <(find "$DT" -type f -name firmware-name 2>/dev/null)
+		# (3) node *basename* matches (catches reserved-memory/wcnss@... without any compatible/firmware-name)
+		while IFS= read -r d; do
+			name="$(basename "$d")"
+			grep -qiE 'wcnss|pronto|riva|iris' <<<"$name" || continue
+			printf '%s|%s|%s|%s\n' "${d#$DT}" "$(dtstr "$d/compatible")" "$(dtstr "$d/status")" "$(dtstr "$d/firmware-name")"
+		done < <(find "$DT" -type d \( -name '*wcnss*' -o -name '*pronto*' -o -name '*riva*' -o -name '*iris*' \) 2>/dev/null)
+	} | sort -u)"
+	if [[ -n "$tmphits" ]]; then
+		printf '%s\n' "$tmphits"
+		return 0
+	fi
+	# (4) last-ditch: any reserved-memory node whose base address is referenced in dmesg wcnss lines
+	local dm; dm="$(dmesg 2>/dev/null | tr -d '\0' | grep -oiE 'wcnss@[0-9a-f]+' | head -1)" || true
+	if [[ -n "$dm" ]]; then
+		# just emit a synthetic row referencing the address from dmesg so the user knows the kernel saw it
+		printf '(synthesised from dmesg /sys kernel log -> matches remoteproc in /sys/class/remoteproc below)|dmesg:%s|okay|wcnss.mdt (assumed)\n' "$dm"
+	fi
+}
+
+# Paths (relative to /lib/firmware) the kernel will ask for; DT firmware-name wins, else driver defaults.
+fw_wcnss() { local p; p="$(dt_nodes | awk -F'|' '$4 ~ /\.(mdt|mbn)$/ {print $4; exit}')"; echo "${p:-wcnss.mdt}"; }
+fw_nv()    { local p; p="$(dt_nodes | awk -F'|' '$4 ~ /\.bin$/ {print $4; exit}')";           echo "${p:-wlan/prima/WCNSS_qcom_wlan_nv.bin}"; }
+
+wcnss_rprocs() {
+	local r fw c
+	for r in "$SYS"/class/remoteproc/remoteproc*; do
+		[[ -e "$r" ]] || continue
+		# (a) of_node/compatible mentions wcnss / pronto
+		c="$(tr '\0' ' ' < "$r/device/of_node/compatible" 2>/dev/null)"
+		if grep -qiE 'wcnss|pronto' <<<"$c"; then echo "$r"; continue; fi
+		# (b) the remoteproc itself declares firmware = wcnss*.mdt/mbn in sysfs
+		fw="$(cat "$r/firmware" 2>/dev/null || true)"
+		if grep -qiE 'wcnss|pronto|riva' <<<"$fw"; then echo "$r"; continue; fi
+		# (c) remoteproc 'name' attr uses a wcnss address (a2040000 / 6000000) or says wcnss
+		c="$(cat "$r/name" 2>/dev/null || true)"
+		if grep -qiE 'wcnss|a2040000\.|6000000\.remoteproc' <<<"$c"; then echo "$r"; continue; fi
+	done
+}
+
+cmd_diag() {
+	say "kernel"; uname -a
+	echo "modules dir: $(ls -d /lib/modules/"$(uname -r)" 2>/dev/null || echo 'MISSING (rootfs built without out/modroot?)')"
+	say "kernel config (CONFIG_* symbol    -> produces .ko basename: legend at end of modules list below)"
+	local cfg=""; [[ -r /proc/config.gz ]] && cfg=/proc/config.gz; [[ -z $cfg && -r /boot/config-$(uname -r) ]] && cfg="/boot/config-$(uname -r)"
+	if [[ "$cfg" == *.gz ]]; then zcat "$cfg"; elif [[ -n "$cfg" ]]; then cat "$cfg"; else echo "(no /proc/config.gz; check: modinfo wcn36xx)"; fi \
+		| grep -E '^CONFIG_(CFG80211|MAC80211|WCN36XX|QCOM_WCNSS_PIL|QCOM_WCNSS_CTRL|BT|BT_QCA|BT_QCOMSMD|BT_HIDP|UHID|VFAT_FS|RFKILL|LIBARC4|QCOM_COMMON|QCOM_PIL_INFO)=' || true
+	say "modules (.ko basename   -> 'file' = resolvable via depmod; 'loaded' = lsmod shows it)"
+	local m has_fname
+	# CONFIG_SYMBOL -> .ko basename quick reference (printed as a legend after the table):
+	#   QCOM_WCNSS_CTRL  => wcnss_ctrl  (symbol has QCOM_ prefix, ko basename does NOT)
+	#   QCOM_WCNSS_PIL   => qcom_wcnss_pil
+	#   WCN36XX          => wcn36xx
+	#   CFG80211 / MAC80211 / RFKILL / BT  => cfg80211 / mac80211 / rfkill / bluetooth
+	#   BT_QCA           => btqca
+	#   BT_QCOMSMD       => btqcomsmd
+	#   BT_HIDP          => hidp
+	#   UHID             => uhid
+	#   REMOTEPROC_QCOM_COMMON / REMOTEPROC_QCOM_PIL_INFO  => qcom_common / qcom_pil_info (may be built-in)
+	#   CRYPTO_LIB_ARC4  => libarc4
+	for m in rfkill libarc4 cfg80211 mac80211 wcn36xx qcom_common qcom_pil_info qcom_wcnss_pil wcnss_ctrl btqca btqcomsmd bluetooth hidp uhid; do
+		has_fname="no"; modinfo -n "$m" >/dev/null 2>&1 && has_fname="yes"
+		printf '  %-16s file=%-6s loaded=%s\n' "$m" "$has_fname" "$(lsmod | awk -v m="$m" '$1==m{f=1} END{print f?"yes":"no"}')"
+	done
+	echo "  legend: QCOM_WCNSS_CTRL => wcnss_ctrl (symbol prefix is NOT the module filename). Others match pretty closely."
+	say "device tree (wcnss-related nodes: path | compatible | status | firmware-name)"
+	local n; n="$(dt_nodes)"
+	if [[ -n "$n" ]]; then
+		echo "$n"
+		local n_sysfs; n_sysfs="$(wcnss_rprocs | wc -l)"
+		if [[ -z "$(echo "$n" | grep -v '^ *$' | grep -v 'synthesised from dmesg')" && $n_sysfs -gt 0 ]]; then
+			echo "NOTE: DT nodes only visible via dmesg fallback above; actual wcnss remoteproc exists in sysfs ($n_sysfs device(s) in /sys/class/remoteproc below). The kernel can still drive it."
+		fi
+	else
+		local n_sysfs; n_sysfs="$(wcnss_rprocs | wc -l)"
+		if [[ $n_sysfs -gt 0 ]]; then
+			echo "no /proc/device-tree matches, BUT sysfs has $n_sysfs wcnss remoteproc(s) -> continue to 'firmware' + 'start'. (DTS expose path via a different compatible string than this helper knew about; kernel driver already bound.)"
+		else
+			echo "NONE FOUND -> this DTB has no wcnss/wifi node AND /sys/class/remoteproc has no wcnss device; that needs a kernel/DTS change, firmware alone won't help"
+		fi
+	fi
+	say "DTS sanity: reserved-memory overlaps / PIL setup sanity (run via sudo for full dmesg)"
+	local wl bad=0
+	wl="$(dmesg 2>/dev/null | grep -iE 'overlaps|overlap|error -22 setting up firmware|Failed to load program segments|mdt hash|Direct firmware load for wcnss|mbox_request_channel.*mboxes|mboxes.*property|mbox.*parse' | tail -20)" || true
+	if [[ -n "$wl" ]]; then
+		echo "$wl"
+		echo
+		# ---------------- specific matches ----------------
+		if grep -qiE 'wcnss.*overlaps|overlaps.*wcnss|qseecom.*wcnss|wcnss.*qseecom|wcnss@[0-9a-f]+' <<<"$wl"; then
+			bad=1
+			cat << 'HELP1'
+  *** DTS BLOCKER #1: reserved-memory OVERLAP between wcnss and qseecom carveouts.
+      This is the ROOT CAUSE of 'error -22 setting up firmware wcnss.mdt'.
+      The PIL driver's ioremap_wc() of the firmware program segments lands inside
+      the qseecom TZBSP region, so the kernel rejects it with -EINVAL regardless
+      of what firmware files you put in /usr/lib/firmware.
+
+      Addresses from a typical failing boot:
+        wcnss   region -> 0x8d900000..0x8e0fffff (size 0x00800000, 8 MiB)
+        qseecom region -> 0x8dd00000..0x8f600000 (size 0x01900000, 25 MiB)
+      Overlap window: 0x8dd00000..0x8e0fffff = 3.25 MiB.
+
+      DTS fix (either strategy works, pick one):
+        (A) Shrink+relocate qseecom so it starts AFTER wcnss ends. Move qseecom
+            to 0x8e200000, size 16 MiB (still plenty for TZBSP):
+                qseecom_region: qseecom@8e200000 {
+                    reg = <0x0 0x8e200000 0x0 0x01000000>;  // was: 0x8dd00000 / 0x01900000
+                    no-map;
+                };
+        (B) Move wcnss ABOVE qseecom instead. Delete the old wcnss@8d200000
+            node and add a 16 MiB hole at 0x90000000:
+                wcnss_region: wcnss@90000000 {
+                    reg = <0x0 0x90000000 0x0 0x01000000>;
+                    no-map;
+                };
+            Keep the label 'wcnss_region' so &wcnss_region memory-region
+            references still resolve without further edits.
+
+      After editing the DTS, rebuild kernel/dtbs, reflash out/boot.img, then re-run
+      'sudo kenzo-wifi start' — the same wcnss firmware files will then boot OK.
+HELP1
+		fi
+		if grep -qiE 'mbox_request_channel.*mboxes|mboxes.*property|mbox.*parse|can.t parse mboxes' <<<"$wl"; then
+			bad=1
+			cat << 'HELP2'
+  *** DTS BLOCKER #2: 'mbox_request_channel: can't parse "mboxes" property'.
+      The remoteproc smd-edge nodes reference the APCS global mailbox via the
+      'mboxes' phandle, but the referenced 'apcs_glb' node is either missing its
+      #mbox-cells property, disabled, or the smd-edge nodes don't name it.
+      Without working mboxes, smd-edge cannot deliver messages between the AP
+      and the WCNSS Riva/Pronto core — so even if firmware loaded (it doesn't,
+      see BLOCKER #1 above) wlan0 and hci0 would never appear.
+
+      DTS fix (both pieces must be present):
+        (1) in apcs_glb: mailbox@f9011000 (usually msm8956.dtsi / msm8976.dtsi):
+                apcs_glb: mailbox@f9011000 {
+                        compatible = "qcom,msm8976-apcs";
+                        reg = <0x0 0xf9011000 0x0 0x1000>;
+                        interrupts = <GIC_SPI 252 IRQ_TYPE_EDGE_RISING>;
+                        #mbox-cells = <1>;    // <- make sure this is >= 1
+                };
+        (2) in each wcnss/pronto smd-edge node (qcom,smd-edge):
+                    mboxes = <&apcs_glb 4>, <&apcs_glb 5>;
+                    mbox-names = "chink", "slimb";
+            (indices 4/5 are wcnss's on 8956/8976; adjust if your SoC docs differ).
+            Rebuild dtbs, reflash boot.img, and re-run 'kenzo-wifi start'.
+HELP2
+		fi
+		# Generic tail guidance (shown only if none of the above matched explicitly)
+		if [ "$bad" -eq 0 ]; then
+			echo "  -> overlaps usually mean the DTS reserved-memory ranges need a fix (kernel side)."
+			echo "  -> error -22 setting up firmware usually means (a) MDT split segments missing/too small, (b) firmware for the wrong chip (3660 vs 3680), (c) reserved-memory overlap above, or (d) MDT signature invalid on this SoC."
+		fi
+	else
+		echo "  (no dmesg warnings yet — run 'sudo kenzo-wifi start' then re-run diag for the boot-time errors)."
+	fi
+	say "remoteproc"
+	local r any=0; for r in "$SYS"/class/remoteproc/remoteproc*; do [[ -e $r ]] || continue; any=1
+		echo "  $(basename "$r"): name=$(cat "$r/name" 2>/dev/null) state=$(cat "$r/state" 2>/dev/null) firmware=$(cat "$r/firmware" 2>/dev/null)"; done
+	[[ $any -eq 1 ]] || echo "  none"
+	say "firmware the kernel will look for (under $FWDIR)"
+	local w nv; w="$(fw_wcnss)"; nv="$(fw_nv)"
+	for f in "$w" "$nv" regulatory.db; do printf '  %-60s %s\n' "$f" "$([[ -e $FWDIR/$f ]] && echo present || echo MISSING)"; done
+	local base; base="$(dirname "$w")"
+	# sizes / listing
+	local mdt_path="$FWDIR/$w"
+	if [[ -e "$mdt_path" ]]; then
+		local mdt_sz btot bn
+		mdt_sz="$(stat -c%s "$mdt_path" 2>/dev/null || echo 0)"
+		btot=0; bn=0; local sfx
+		for sfx in "$FWDIR/$base"/"$(basename "${w%.mdt}")".b*; do
+			[[ -e "$sfx" ]] || continue
+			btot=$((btot + $(stat -c%s "$sfx" 2>/dev/null || echo 0)))
+			bn=$((bn+1))
+		done
+		printf '  split segments next to %s: count=%d  total_size=%d bytes (mdt alone=%d bytes)\n' "$(basename "$w")" "$bn" "$btot" "$mdt_sz"
+		[[ $mdt_sz -lt 8000 && $btot -eq 0 ]] && echo "  WARNING: mdt is only ~$mdt_sz bytes and NO .bNN segments exist -> split firmware is incomplete; Pronto PIL will likely fail with -22 EINVAL."
+		[[ $mdt_sz -lt 8000 && $btot -gt 0 && $btot -lt 500000 ]] && echo "  WARNING: total .bNN segments < 500 KB; check this is the right firmware for WCN3660B (not WCN3680 / not a modem image)."
+	else
+		echo "  split segments next to it: (mdt not present -> 0)"
+	fi
+	# list every wcnss/WCNSS file in the fw dir (useful for debugging)
+	say "every wcnss/WCNSS/pronto file under $FWDIR (find -iname ...)"
+	find "$FWDIR" -type f \( -iname '*wcnss*' -o -iname '*pronto*' -o -iname '*WCNSS*' \) 2>/dev/null | sort | while read -r f; do
+		sz="$(stat -c%s "$f" 2>/dev/null)"
+		printf '  %-70s %10d bytes\n' "${f#$FWDIR/}" "$sz"
+	done
+	say "network / bluetooth / rfkill"
+	ip -br link; echo; rfkill list 2>/dev/null || echo "rfkill: nothing (rfkill module not loaded? or rfkill binary missing? apt install rfkill)"
+	ls "$SYS/class/bluetooth" 2>/dev/null || echo "no hciX in /sys/class/bluetooth (bt not up yet)"
+	command -v bluetoothctl >/dev/null && { echo; timeout 3 bluetoothctl list 2>/dev/null || true; }
+	say "dmesg (wcnss / wcn36xx / firmware / bluetooth)"
+	dmesg 2>/dev/null | grep -iE 'wcn|riva|pronto|iris|remoteproc|rpmsg|smd|firmware|bluetooth|hci0|cfg80211|regulatory|overlaps' | tail -60 || true
+	cat << 'H'
+
+How to read this:
+  * .ko files missing                  -> build-rootfs.sh ran BEFORE build-kernel.sh; rebuild in order;
+                                         or modules dir version != uname -r (reflash both boot + rootfs).
+  * wcnss_ctrl file=no / loaded=no     -> IGNORE any old script that asks for 'qcom_wcnss_ctrl';
+                                         the real .ko basename is wcnss_ctrl.ko (symbol QCOM_WCNSS_CTRL).
+  * state=offline + firmware MISSING   -> run:  sudo kenzo-wifi firmware ; sudo kenzo-wifi start
+  * state=offline + error -22 (EINVAL) -> see 'DTS sanity' above. Most often: (1) reserved-memory
+                                         wcnss@addr overlaps qseecom (needs kernel/DTS fix), or (2) the
+                                         MDT split .bNN segments are missing / copied from the wrong chip.
+  * remoteproc boots OK, no wlan0      -> rfkill list ; sudo rfkill unblock all ; check wcn36xx loaded.
+  * "NONE FOUND" device tree note      -> if sysfs remoteproc0 says wcnss firmware=wcnss.mdt the driver
+                                         is bound anyway; proceed with 'firmware' + 'start'.
+H
+}
+
+mount_label() {   # label -> prints mountpoint (read-only) or nothing
+	local dev="/dev/disk/by-partlabel/$1" m
+	[[ -b $dev ]] || return 1
+	m="$(mktemp -d /run/kenzo-wifi.XXXXXX)"; TMPS+=("$m")
+	mount -o ro "$dev" "$m" 2>/dev/null || mount -o ro -t vfat "$dev" "$m" 2>/dev/null || { rmdir "$m"; return 1; }
+	echo "$m"
+}
+
+cmd_firmware() {
+	need_root
+	local modem="" nv="" a
+	while [[ $# -gt 0 ]]; do case "$1" in
+		--modem) modem="$2"; shift 2 ;; --nv) nv="$2"; shift 2 ;;
+		*) echo "unknown arg $1" >&2; exit 1 ;; esac; done
+
+	local w_rel nv_rel; w_rel="$(fw_wcnss)"; nv_rel="$(fw_nv)"
+	echo "kernel wants: $w_rel (+ segments)  and  $nv_rel"
+
+	# --- wcnss.mdt + wcnss.bNN ---
+	if [[ -z "$modem" ]]; then
+		for l in "${LABELS_MODEM[@]}"; do
+			m="$(mount_label "$l")" || continue
+			f="$(find "$m" -iname 'wcnss.mdt' 2>/dev/null | head -1)"
+			[[ -n "$f" ]] && { modem="$(dirname "$f")"; echo "found wcnss.* in partition '$l' ($(dirname "${f#$m}"))"; break; }
+		done
+	fi
+	if [[ -z "$modem" || -z "$(find "$modem" -maxdepth 1 -iname 'wcnss.mdt' 2>/dev/null)" ]]; then
+		cat >&2 << 'E'
+Couldn't find wcnss.mdt on the modem partition. Provide it yourself, e.g. from the phone's old firmware:
+  - Copy wcnss.mdt + wcnss.b00..b12 (from NON-HLOS.bin / the MIUI or Lineage firmware zip, folder "image/")
+    to the phone (scp over USB), then:   sudo kenzo-wifi firmware --modem /path/to/that/folder
+E
+		exit 1
+	fi
+	local dst; dst="$FWDIR/$(dirname "$w_rel")"; install -d "$dst"
+	local base; base="$(basename "${w_rel%.*}")"      # wcnss
+	local n=0 f mdt_sz btot sz_sfx
+	mdt_sz=0; btot=0
+	for f in "$modem"/*; do
+		b="$(basename "$f")"; lb="${b,,}"
+		[[ "$lb" == "$base".* ]] || continue
+		install -m644 "$f" "$dst/$lb" && n=$((n+1))
+		sz_sfx="$(stat -c%s "$f" 2>/dev/null || echo 0)"
+		if [[ "$lb" == "$base.mdt" ]]; then mdt_sz=$sz_sfx
+		elif [[ "$lb" == "$base".b* ]]; then btot=$((btot + sz_sfx)); fi
+	done
+	# kernel asks for .mdt or .mbn depending on DT; the split loader only reads .mdt+.bNN, so make sure .mdt exists
+	[[ "$w_rel" == *.mbn && ! -e "$dst/$base.mbn" ]] && echo "NOTE: DT wants $w_rel but only split files exist; DTS 'firmware-name' should end in .mdt for split images."
+	printf 'installed %d files -> %s  (mdt size=%d bytes, %d x .bNN total=%d bytes, combined ~%d KB)\n' \
+		"$n" "$dst" "$mdt_sz" "$((n-1))" "$btot" "$(( (mdt_sz + btot) / 1024 ))"
+	[[ $n -gt 1 && $mdt_sz -lt 8000 && $btot -lt 500000 ]] && echo "WARNING: .bNN total is tiny (< 500KB). These might be the wrong split files (modem instead of pronto?). Re-extract from the exact wcnss.* files in the 'image/' folder inside NON-HLOS.bin for Kenzo." >&2
+	# also look for ancillary firmware (pronto.mbn, mba.mbn, .bin dictionaries) that some DTSi ask for
+	local extra
+	for extra in "$modem"/pronto* "$modem"/mba* "$modem"/WCNSS*; do
+		[[ -e "$extra" ]] || continue
+		b="$(basename "$extra")"
+		[[ -e "$dst/$b" ]] && continue
+		install -m644 "$extra" "$dst/$b" && echo "  also installed ancillary $b"
+	done
+
+	# --- NV calibration ---
+	if [[ -z "$nv" ]]; then
+		for l in "${LABELS_NV[@]}"; do
+			m="$(mount_label "$l")" || continue
+			f="$(find "$m" -iname 'WCNSS_qcom_wlan_nv.bin' 2>/dev/null | head -1)"
+			[[ -n "$f" ]] && { nv="$f"; echo "found NV bin in partition '$l'"; break; }
+		done
+	fi
+	if [[ -n "$nv" && -r "$nv" ]]; then
+		install -D -m644 "$nv" "$FWDIR/$nv_rel"; echo "installed NV -> $FWDIR/$nv_rel"
+	else
+		cat >&2 << 'E'
+Couldn't find WCNSS_qcom_wlan_nv.bin on the phone's partitions (the Android system partition may be gone).
+Get it from the old Android system ("/vendor/firmware/wlan/prima/" or "/system/etc/firmware/wlan/prima/" in a
+Lineage/MIUI zip or `adb pull`) and run:  sudo kenzo-wifi firmware --nv /path/WCNSS_qcom_wlan_nv.bin
+E
+		exit 1
+	fi
+	echo; echo "Done. Next:  sudo kenzo-wifi start"
+}
+
+cmd_start() {
+	need_root
+	for m in rfkill libarc4 cfg80211 mac80211 qcom_common qcom_pil_info qcom_wcnss_pil wcnss_ctrl wcn36xx bluetooth btqca btqcomsmd hidp uhid; do modprobe "$m" 2>/dev/null || true; done
+	local r
+	local any_rproc=0 any_online=0 any_failed=0
+	for r in $(wcnss_rprocs); do
+		any_rproc=1
+		echo "restarting $(basename "$r") (firmware=$(cat "$r/firmware" 2>/dev/null))..."
+		echo stop  > "$r/state" 2>/dev/null || true
+		sleep 2
+		# start — ignore EINVAL write error because the kernel also logs the real reason to dmesg
+		echo start > "$r/state" 2>/dev/null || true
+		sleep 1
+		local st; st="$(cat "$r/state" 2>/dev/null)"
+		echo "  state: $st"
+		case "$st" in
+			running|online) any_online=$((any_online+1)) ;;
+			offline|crashed) any_failed=$((any_failed+1)) ;;
+		esac
+	done
+	if [[ $any_rproc -eq 0 ]]; then
+		echo "no wcnss remoteproc registered. Usual causes:"
+		echo "  - qcom_wcnss_pil.ko / wcnss_ctrl.ko modules not loaded (run: depmod -a && modprobe qcom_wcnss_pil wcnss_ctrl)"
+		echo "  - no DT node describing wcnss (need a kernel/DTS rebuild)"
+		echo "  -> run sudo kenzo-wifi diag for the full picture"
+	fi
+	sleep 5
+	rfkill unblock all 2>/dev/null || true
+	command -v systemctl >/dev/null && systemctl enable --now bluetooth 2>/dev/null || true
+	say "result"
+	ip -br link; echo
+	dmesg | grep -iE 'wcn|riva|pronto|remoteproc|firmware|hci0|wlan|bluetooth|overlaps|program segments' | tail -40
+	echo
+	# ------ targeted post-mortem hints ------
+	if [[ $any_failed -gt 0 ]]; then
+		say "post-mortem: Pronto remoteproc stayed offline (state != running/online)"
+		local dm
+		dm="$(dmesg 2>/dev/null | tail -200)"
+		if grep -qE 'overlaps.*wcnss|wcnss.*overlaps' <<<"$dm"; then
+			echo "  -> reserved-memory OVERLAP detected in dmesg (wcnss carveout clashes with qseecom@addr)."
+			echo "     Fix in the kernel DTS: shrink one of them. Without fixing this the PIL driver will"
+			echo "     keep returning error -22 (EINVAL) from qcom_wcnss_pil no matter what firmware you use."
+		fi
+		if grep -qE 'error -22 setting up firmware|Failed to load program segments|Boot failed: -22' <<<"$dm"; then
+			echo "  -> boot -22 / EINVAL from qcom_wcnss_pil. Likely causes (check diag 'firmware' section for sizes):"
+			echo "     (a) only wcnss.mdt header (~7 KB) copied but the 9x .bNN segments are missing / tiny"
+			echo "     (b) segments belong to WCN3680 / wrong chip (kenzo uses WCN3660B, iris=2)"
+			echo "     (c) signed hash in MDT doesn't match this SoC (use the EXACT wcnss.* files from"
+			echo "         the Kenzo NON-HLOS.bin, not a dump from another msm8956 phone)."
+		fi
+		if grep -qE 'wcnss.*: request_firmware failed: -2' <<<"$dm"; then
+			echo "  -> wcnss.mdt is not in /usr/lib/firmware/ (run sudo kenzo-wifi firmware first)."
+		fi
+	fi
+	# ------ up / not up messages ------
+	local wl_if
+	wl_if="$(ip -br link | awk '$1 ~ /^(wlan|wlx)/ {print $1; exit}')"
+	local bt_hci
+	bt_hci="$(ls /sys/class/bluetooth/ 2>/dev/null | head -1)"
+	if [[ -n "$wl_if" ]]; then
+		echo "Wi-Fi interface is up ($wl_if). Connect with:"
+		echo "   nmcli device wifi list ; sudo nmcli device wifi connect 'SSID' password 'PASS'"
+		echo "   iw reg set IN ; rfkill unblock wlan  (if scan is empty)"
+	else
+		echo "No wlan interface yet."
+		if [[ $any_online -gt 0 ]]; then
+			echo "  remoteproc IS running, but wlan0 missing. Check: rfkill list (soft-blocked?); lsmod | grep wcn36xx; dmesg | grep MAC"
+		else
+			echo "  remoteproc did NOT come up -> run sudo kenzo-wifi diag and look at 'DTS sanity' / sizes above."
+		fi
+	fi
+	if [[ -n "$bt_hci" ]]; then
+		echo "Bluetooth HCI up ($bt_hci). Pair a wireless keyboard with:"
+		echo "   bluetoothctl  ->  power on / agent on / scan on / pair XX:XX / trust XX:XX / connect XX:XX"
+	else
+		if lsmod 2>/dev/null | grep -q '^btqcomsmd'; then
+			echo "Bluetooth module btqcomsmd loaded but no hciX yet -> check dmesg 'HCI' lines above, or rerun after reboot once firmware is in place."
+		else
+			echo "Bluetooth not up yet (btqcomsmd may not have loaded). Run: sudo modprobe bluetooth btqca btqcomsmd hidp uhid ; sudo systemctl restart bluetooth"
+		fi
+	fi
+}
+
+cmd_connect() {
+	need_root
+	local ssid="${1:-}" pass="${2:-}"
+	if [[ -z "$ssid" ]]; then
+		say "Scanning available Wi-Fi networks..."
+		nmcli device wifi rescan 2>/dev/null || true
+		sleep 2
+		nmcli --colors no device wifi list
+		echo ""
+		read -rp "Enter Wi-Fi SSID to connect: " ssid
+		[[ -n "$ssid" ]] || { echo "No SSID entered."; return 0; }
+	fi
+	if [[ -z "$pass" ]]; then
+		read -rsp "Password for '$ssid': " pass; echo
+	fi
+
+	say "Writing /etc/netplan/50-wifi-init.yaml (renderer: NetworkManager)..."
+	install -d -m700 /etc/netplan
+	local cfg="/etc/netplan/50-wifi-init.yaml"
+
+	python3 -c "
+import sys, yaml, os
+
+ssid = sys.argv[1]
+password = sys.argv[2]
+path = '/etc/netplan/50-wifi-init.yaml'
+
+cfg = {
+    'network': {
+        'version': 2,
+        'renderer': 'NetworkManager',
+        'wifis': {
+            'wlan0': {
+                'optional': True,
+                'access-points': {},
+                'dhcp4': True
+            }
+        }
+    }
+}
+
+if os.path.exists(path):
+    try:
+        with open(path, 'r') as f:
+            data = yaml.safe_load(f)
+            if isinstance(data, dict) and 'network' in data:
+                cfg = data
+                cfg['network'].setdefault('renderer', 'NetworkManager')
+                cfg['network'].setdefault('wifis', {}).setdefault('wlan0', {})
+                cfg['network']['wifis']['wlan0'].setdefault('access-points', {})
+                cfg['network']['wifis']['wlan0'].setdefault('dhcp4', True)
+    except Exception:
+        pass
+
+prio = '10' if any(k in ssid.lower() for k in ['5g', '5ghz']) else '0'
+cfg['network']['wifis']['wlan0']['access-points'][ssid] = {
+    'password': password,
+    'networkmanager': {'passthrough': {'connection.autoconnect-priority': prio}}
+}
+
+with open(path, 'w') as f:
+    yaml.dump(cfg, f, default_flow_style=False)
+
+os.chmod(path, 0o600)
+" "$ssid" "$pass"
+
+	rm -f /etc/netplan/90-NM-*.yaml 2>/dev/null || true
+	chmod 600 /etc/netplan/*.yaml 2>/dev/null || true
+	chown -R root:root /etc/netplan 2>/dev/null || true
+
+	say "Applying netplan..."
+	netplan apply
+	sleep 3
+	nmcli device status
+	local ip; ip="$(ip -br addr show dev wlan0 2>/dev/null | awk '{print $3}')"
+	if [[ -n "$ip" ]]; then
+		echo "Connected! IP address: $ip"
+	else
+		echo "Connection in progress... Run 'nmcli device status' to verify."
+	fi
+}
+
+case "${1:-}" in
+	diag)     cmd_diag ;;
+	firmware) shift; cmd_firmware "$@" ;;
+	start)    cmd_start ;;
+	connect)  shift; cmd_connect "$@" ;;
+	*) sed -n 2,11p "$0"; exit 1 ;;
+esac
+
